@@ -84,10 +84,94 @@ if GDN_AITER_TRITON_AVAILABLE:
         fused_rearrange_sigmoid_gated_delta_rule as gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,  # noqa: E501
     )
 
+# Native RDNA2 GDN decode kernels
+_GDN_RDNA2_CONV1D_AVAILABLE = False
+_GDN_RDNA2_SIGMOID_AVAILABLE = False
+if current_platform.is_rocm():
+    try:
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x():
+            from vllm import _custom_ops as _gdn_ops
+
+            _GDN_RDNA2_CONV1D_AVAILABLE = hasattr(
+                _gdn_ops, "gdn_conv1d_update_rdna2"
+            )
+            _GDN_RDNA2_SIGMOID_AVAILABLE = hasattr(
+                _gdn_ops, "gdn_sigmoid_gating_delta_rule_update_rdna2"
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
 logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+def _rdna2_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state_indices: torch.Tensor | None,
+) -> torch.Tensor:
+    """RDNA2-native causal_conv1d_update wrapper."""
+    from vllm import _custom_ops as _gdn_ops
+
+    return _gdn_ops.gdn_conv1d_update_rdna2(
+        x,
+        weight,
+        bias,
+        conv_state,
+        conv_state_indices,
+    )
+
+
+def _rdna2_sigmoid_gating(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    ssm_state_indices: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RDNA2-native fused_sigmoid_gating_delta_rule_update wrapper.
+
+    Expects q, k of shape [B, T, H, K] and v of shape [B, T, HV, V].
+    """
+    from vllm import _custom_ops as _gdn_ops
+
+    B, T = q.shape[0], q.shape[1]
+    HV, V = v.shape[2], v.shape[3]
+    K = q.shape[3]
+    o = torch.empty((B, T, HV, V), dtype=q.dtype, device=q.device)
+    final_state = initial_state.clone()
+    _gdn_ops.gdn_sigmoid_gating_delta_rule_update_rdna2(
+        A_log,
+        a,
+        b,
+        dt_bias,
+        q,
+        k,
+        v,
+        initial_state,
+        cu_seqlens,
+        ssm_state_indices,
+        1.0,
+        20.0,
+        K**-0.5,
+        True,
+        use_qk_l2norm_in_kernel,
+        o,
+        final_state,
+    )
+    return o, final_state
 
 
 def _resolve_gdn_prefill_backend(
@@ -1363,17 +1447,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
-            mixed_qkv_non_spec = causal_conv1d_update(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+            if _GDN_RDNA2_CONV1D_AVAILABLE:
+                csi_slice = non_spec_state_indices_tensor[  # type: ignore[index]
                     : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-                ],
-                validate_data=True,
-            )
+                ]
+                mixed_qkv_non_spec = _rdna2_conv1d_update(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    csi_slice,
+                )
+            else:
+                mixed_qkv_non_spec = causal_conv1d_update(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                        : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+                    ],
+                    validate_data=True,
+                )
         else:
             mixed_qkv_non_spec = None
 
@@ -1526,25 +1622,45 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [core_attn_out_decode, core_attn_out_non_spec], dim=1
                 )
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_decodes
-                        + 1  # type: ignore[attr-defined]
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
+            if _GDN_RDNA2_SIGMOID_AVAILABLE:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    _rdna2_sigmoid_gating(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                            : attn_metadata.num_decodes
+                            + 1  # type: ignore[attr-defined]
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
                 )
-            )
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                            : attn_metadata.num_decodes
+                            + 1  # type: ignore[attr-defined]
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
