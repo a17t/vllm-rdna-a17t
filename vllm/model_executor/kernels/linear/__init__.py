@@ -54,6 +54,15 @@ from vllm.model_executor.kernels.linear.mixed_precision.machete import (
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.rdna2_awq_w4a16 import (
+    RDNA2AWQLinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.rdna2_triton_w4a16 import (
+    RDNA2TritonW4A16LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.rdna2_w4a16 import (
+    RDNA2W4A16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
     RDNA3W4A16LinearKernel,
 )
@@ -481,6 +490,9 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         HummingLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        RDNA2AWQLinearKernel,
+        RDNA2TritonW4A16LinearKernel,
+        RDNA2W4A16LinearKernel,
         RDNA3W4A16LinearKernel,
         RDNAHybridW4A16LinearKernel,
         TritonW4A16LinearKernel,
@@ -1194,6 +1206,8 @@ __all__ = [
     "RDNAHybridW4A16LinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
+    "RDNA2TritonW4A16LinearKernel",
+    "RDNA2W4A16LinearKernel",
     "TritonW4A16LinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
