@@ -339,6 +339,23 @@ class AutoAWQConfig(QuantizationConfig):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
 
+            if current_platform.is_rocm():
+                from vllm.platforms.rocm import on_gfx10x
+
+                if on_gfx10x():
+                    from .awq_moe_rdna2 import (
+                        AWQMoERDNA2Method,
+                        _is_rdna2_awq_supported,
+                    )
+
+                    if _is_rdna2_awq_supported():
+                        logger.warning_once(
+                            "RDNA2 Experimental: using AWQMoERDNA2Method "
+                            "(native RDNA2 HIP kernel) for '%s'",
+                            prefix,
+                        )
+                        return AWQMoERDNA2Method(self, layer.moe_config)
+
             if not check_moe_marlin_supports_layer(
                 layer, self.group_size, allow_tile_padding=True
             ):
