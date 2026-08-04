@@ -951,6 +951,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         Dequants previously cached K/V, concatenates with the current
         chunk's raw K/V, then runs flash_attn with causal masking.
         """
+        # TurboQuant FP8 keys are unsupported on RDNA2 (gfx1030): the Triton
+        # ROCm backend crashes when tl.float8e4nv/e4b15 types appear in the IR.
+        if self.tq_config.key_fp8:
+            from vllm.platforms.rocm import on_gfx10x
+
+            if on_gfx10x():
+                raise RuntimeError(
+                    "TurboQuant FP8 keys (turboquant_k8v4) are not supported "
+                    "on RDNA2 (gfx1030). Use turboquant_4bit_nc, "
+                    "turboquant_k3v4_nc, or turboquant_3bit_nc instead."
+                )
+
         q_len, Hq, D = query.shape
         Hk = key_chunk.shape[1]
         device = query.device

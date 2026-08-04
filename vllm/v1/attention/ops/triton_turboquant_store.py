@@ -360,6 +360,19 @@ def triton_turboquant_store(
     key_fp8: bool = False,
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
+    # TurboQuant FP8 keys are unsupported on RDNA2 (gfx1030): the Triton ROCm
+    # backend crashes when tl.float8e4nv/e4b15 types appear in the IR. Guard
+    # up-front so the FP8-typed store kernel is never specialized on gfx10x.
+    if key_fp8:
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x():
+            raise RuntimeError(
+                "TurboQuant FP8 keys (turboquant_k8v4) are not supported on "
+                "RDNA2 (gfx1030). Use turboquant_4bit_nc, turboquant_k3v4_nc, "
+                "or turboquant_3bit_nc instead."
+            )
+
     N, H, D = key.shape
     NH = N * H
     block_size = kv_cache.shape[1]

@@ -508,6 +508,20 @@ def triton_turboquant_decode_attention(
 
     Returns: output tensor [B, Hq, D] in query's dtype.
     """
+    # TurboQuant FP8 keys (turboquant_k8v4) are not supported on RDNA2
+    # (gfx1030): the Triton ROCm backend crashes when tl.float8e4nv/e4b15
+    # types appear in the IR, even in dead code paths. Guard up-front so the
+    # FP8-typed kernel is never specialized on gfx10x.
+    if key_fp8:
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x():
+            raise RuntimeError(
+                "TurboQuant FP8 keys (turboquant_k8v4) are not supported on "
+                "RDNA2 (gfx1030). Use turboquant_4bit_nc, turboquant_k3v4_nc, "
+                "or turboquant_3bit_nc instead."
+            )
+
     B, Hq, D = query.shape
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
