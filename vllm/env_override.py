@@ -102,7 +102,18 @@ os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "1"
 
 # see https://github.com/vllm-project/vllm/issues/10480 and
 # https://github.com/vllm-project/vllm/issues/10619.
-os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+# RDNA2 (gfx10xx): allow 4 threads for faster parallel Triton compilation
+# (the single-thread setting causes extremely slow startup).
+if not os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"):
+    try:
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x():
+            os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "4"
+        else:
+            os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    except ImportError:
+        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
 # Enable Triton autotuning result caching to disk by default.
 # Without this, Triton re-runs autotuning on every process restart,

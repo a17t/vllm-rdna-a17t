@@ -24,6 +24,16 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
+
+def _is_rocm_gfx10x() -> bool:
+    """Check if running on RDNA2 (gfx10xx)."""
+    try:
+        from vllm.platforms.rocm import on_gfx10x
+
+        return on_gfx10x()
+    except ImportError:
+        return False
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.attention.backend import AttentionCGSupport
@@ -980,6 +990,12 @@ class CompilationConfig:
             and "benchmark_combo_kernel" not in self.inductor_compile_config
             # (fixme @boyuan) combo kernel does not support cpu yet.
             and not current_platform.is_cpu()
+            # RDNA2 (gfx10xx): benchmark_combo_kernel causes extremely slow
+            # Triton compilation (10+ minutes). Disable for fast startup.
+            and not (
+                current_platform.is_rocm()
+                and _is_rocm_gfx10x()
+            )
         ):
             # use horizontal fusion, which is useful for fusing qk-norm and
             # qk-rope when query and key have different shapes.
