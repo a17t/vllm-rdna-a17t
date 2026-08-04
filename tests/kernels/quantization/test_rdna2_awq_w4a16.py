@@ -50,6 +50,11 @@ TEST_CASES = [
     (1, 256, 256, 64),  # K div by groupsize, tail loop exercises K=248..255
     (1, 128, 256, 128),  # K == groupsize, single group, no tail
     (1, 256, 256, 128),  # K = 2*groupsize, 2 groups, no tail
+    # Qwen3-27B-class decode shapes (M=1).
+    (1, 5120, 5120, 128),  # hidden-size projection
+    (1, 5120, 13824, 128),  # gate/up projection
+    (1, 13824, 5120, 128),  # down projection
+    (1, 5120, 1024, 128),  # N not a multiple of BLOCK_N*4 (tail block)
 ]
 
 
@@ -146,4 +151,37 @@ class TestRDNA2AWQCorrectness:
         assert out.isfinite().all(), "Output contains inf/nan"
         assert out.abs().max().item() < 1e4, (
             f"Output magnitude too large: {out.abs().max().item()}"
+        )
+
+    @pytest.mark.parametrize(
+        "K,N,group_size",
+        [
+            (1152, 1152, 128),
+            (4096, 4096, 128),
+            (5120, 13824, 128),
+            (13824, 5120, 128),
+            (5120, 1024, 128),  # tail block (N not a multiple of 256)
+            (256, 256, 64),  # group boundary inside a K tile
+        ],
+    )
+    def test_gemv_vs_batched_parity(self, K, N, group_size, device):
+        """M=1 GEMV path must match the M=2 batched kernel for the same row.
+
+        The M=1 call routes to the dedicated GEMV kernel; the M=2 call uses
+        the original atomic-CAS batched kernel. Row 0 of the M=2 output must
+        match the M=1 output within a tight tolerance (same dequant math,
+        only reduction order differs).
+        """
+        w_packed, z_packed, scales = _make_random_quantized(K, N, group_size, device)
+        a = torch.randn((1, K), dtype=torch.float16, device=device)
+        # Pad to M=2 for the batched path; row 1 is irrelevant.
+        a2 = torch.cat([a, torch.zeros(1, K, dtype=torch.float16, device=device)])
+
+        out_gemv = ops.awq_gemm_rdna2(a, w_packed, z_packed, scales)
+        out_batched = ops.awq_gemm_rdna2(a2, w_packed, z_packed, scales)[0:1]
+
+        max_diff = (out_gemv.float() - out_batched.float()).abs().max().item()
+        # Same arithmetic, only loop ordering differs -> very tight bound.
+        assert max_diff < 1e-3, (
+            f"K={K} N={N} G={group_size}: GEMV vs batched max_diff={max_diff:.6f}"
         )

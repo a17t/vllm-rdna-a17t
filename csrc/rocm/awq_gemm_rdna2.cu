@@ -232,6 +232,94 @@ __global__ void gemm_awq_q4_kernel_rdna2(
   }
 }
 
+// ---------------------------------------------------------------------------
+// M=1 decode GEMV kernel (no K-split, no atomics).
+//
+// Each block owns BLOCK_N output columns and streams the full K dimension,
+// reading each packed weight word exactly once (bandwidth-optimal). One thread
+// per output column -> each output is produced by a single thread, eliminating
+// the atomic-CAS reduction that the batched (M>1) kernel relies on.
+//
+// Weight layout (AWQ): b_q_weight[K, N/8] int32, 8 consecutive N nibbles/word.
+// ---------------------------------------------------------------------------
+template <int BLOCK_N, int TILE_K>
+__global__ void gemv_awq_q4_rdna2(
+    const half* __restrict__ a,             // [K]
+    const uint32_t* __restrict__ b_q_weight,// [K, N/8]
+    const uint32_t* __restrict__ b_qzeros,  // [G, N/8]
+    const half* __restrict__ b_scales,      // [G, N]
+    half* __restrict__ c,                   // [N]
+    const int size_n, const int size_k, const int groups) {
+  static_assert(BLOCK_N % 8 == 0, "BLOCK_N must be a multiple of 8");
+  constexpr int WORDS_PER_ROW = BLOCK_N / 8;  // int32 words per K-row/block
+
+  const int tid = threadIdx.x;
+  const int blk_n = blockIdx.x * BLOCK_N;     // first column owned by this block
+  const int n = blk_n + tid;                   // this thread's output column
+  const int row_words = size_n / 8;            // words per full K-row
+  const int groupsize = size_k / groups;
+
+  // Shared-memory tiles: weight words [TILE_K][WORDS_PER_ROW] + acts [TILE_K].
+  extern __shared__ char smem[];
+  uint32_t* lds_w = reinterpret_cast<uint32_t*>(smem);
+  half* lds_a = reinterpret_cast<half*>(lds_w + TILE_K * WORDS_PER_ROW);
+
+  const int wd = tid / 8;        // word index within this block
+  const int shft = (tid % 8) * 4;  // nibble shift for this column
+  const bool valid = n < size_n;
+
+  // Per-column dequant constants (refreshed on group change): w = nib*y_f + z_f.
+  float z_f = 0.0f, y_f = 0.0f;
+  int cur_group = -1;
+  float acc = 0.0f;
+
+  for (int k0 = 0; k0 < size_k; k0 += TILE_K) {
+    const int kk_end = (TILE_K < size_k - k0) ? TILE_K : (size_k - k0);
+
+    // Cooperative coalesced load of the weight tile + activation tile.
+    const int total_words = kk_end * WORDS_PER_ROW;
+    for (int idx = tid; idx < total_words; idx += BLOCK_N) {
+      const int kk = idx / WORDS_PER_ROW;
+      const int w = idx % WORDS_PER_ROW;
+      const int global_col_word = blk_n / 8 + w;
+      uint32_t wv = 0u;
+      if (global_col_word < row_words) {
+        wv = b_q_weight[(k0 + kk) * row_words + global_col_word];
+      }
+      lds_w[kk * WORDS_PER_ROW + w] = wv;
+    }
+    for (int kk = tid; kk < kk_end; kk += BLOCK_N) {
+      lds_a[kk] = a[k0 + kk];
+    }
+    __syncthreads();
+
+    // Each thread accumulates its own output column over the tile.
+    if (valid) {
+      for (int kk = 0; kk < kk_end; ++kk) {
+        const int k = k0 + kk;
+        const int g = k / groupsize;
+        if (g != cur_group) {
+          const uint32_t qz = b_qzeros[g * row_words + (n / 8)];
+          const int zero = (qz >> shft) & 0xF;
+          prep_zero_scale_fp32(static_cast<uint32_t>(zero),
+                               b_scales[g * size_n + n], z_f, y_f);
+          cur_group = g;
+        }
+        const uint32_t wword = lds_w[kk * WORDS_PER_ROW + wd];
+        const int nibble = (wword >> shft) & 0xF;
+        const float w = __fmaf_rn(static_cast<float>(nibble), y_f, z_f);
+        const float av = __half2float(lds_a[kk]);
+        acc = __fmaf_rn(w, av, acc);
+      }
+    }
+    __syncthreads();  // before next tile load
+  }
+
+  if (valid) {
+    c[n] = __float2half_rn(acc);
+  }
+}
+
 #else
 
 template <int M_COUNT>
@@ -239,6 +327,11 @@ __global__ void gemm_awq_q4_kernel_rdna2(const half*, const uint32_t*,
                                           const uint32_t*, const half*,
                                           half*, const int, const int,
                                           const int, const int) {}
+
+template <int BLOCK_N, int TILE_K>
+__global__ void gemv_awq_q4_rdna2(const half*, const uint32_t*,
+                                  const uint32_t*, const half*, half*,
+                                  const int, const int, const int) {}
 
 #endif
 
@@ -261,13 +354,29 @@ void launch_awq_gemm_q4_for_mcount(const half* a, const uint32_t* b_q_weight,
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups);
 }
 
+template <int BLOCK_N, int TILE_K>
+void launch_gemv_awq_q4(const half* a, const uint32_t* b_q_weight,
+                        const uint32_t* b_qzeros, const half* b_scales,
+                        half* c, int size_n, int size_k, int groups,
+                        cudaStream_t stream) {
+  dim3 block(BLOCK_N);
+  dim3 grid((size_n + BLOCK_N - 1) / BLOCK_N);
+  constexpr int words_per_row = BLOCK_N / 8;
+  const size_t smem = sizeof(uint32_t) * TILE_K * words_per_row +
+                      sizeof(half) * TILE_K;
+  gemv_awq_q4_rdna2<BLOCK_N, TILE_K><<<grid, block, smem, stream>>>(
+      a, b_q_weight, b_qzeros, b_scales, c, size_n, size_k, groups);
+}
+
 void launch_awq_gemm_q4(const half* a, const uint32_t* b_q_weight,
                         const uint32_t* b_qzeros, const half* b_scales,
                         half* c, int size_m, int size_n, int size_k,
                         int groups, cudaStream_t stream) {
   if (size_m == 1) {
-    launch_awq_gemm_q4_for_mcount<1>(a, b_q_weight, b_qzeros, b_scales, c,
-                                      size_m, size_n, size_k, groups, stream);
+    // Dedicated decode GEMV: no atomic-CAS reduction, coalesced weight loads.
+    launch_gemv_awq_q4<256, 32>(a, b_q_weight, b_qzeros, b_scales, c, size_n,
+                                 size_k, groups, stream);
+    return;
   } else if (size_m <= 3) {
     launch_awq_gemm_q4_for_mcount<2>(a, b_q_weight, b_qzeros, b_scales, c,
                                       size_m, size_n, size_k, groups, stream);
