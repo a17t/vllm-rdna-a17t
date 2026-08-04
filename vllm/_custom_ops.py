@@ -599,6 +599,162 @@ def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None
     torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 
 
+def gptq_gemm_rdna2(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_v2_format: bool,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.gptq_gemm_rdna2(
+        a, b_q_weight, b_qzeros, b_scales, b_g_idx, use_v2_format
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "gptq_gemm_rdna2"
+):
+
+    @register_fake("_rocm_C::gptq_gemm_rdna2")
+    def _gptq_gemm_rdna2_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_qzeros: torch.Tensor,
+        b_scales: torch.Tensor,
+        b_g_idx: torch.Tensor,
+        use_v2_format: bool,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device
+        )
+
+
+def awq_gemm_rdna2(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    b_scales: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.awq_gemm_rdna2(a, b_q_weight, b_qzeros, b_scales)
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "awq_gemm_rdna2"):
+
+    @register_fake("_rocm_C::awq_gemm_rdna2")
+    def _awq_gemm_rdna2_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_qzeros: torch.Tensor,
+        b_scales: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (a.size(0), b_q_weight.size(1) * 8), dtype=a.dtype, device=a.device
+        )
+
+
+def gdn_conv1d_update_rdna2(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    conv_state_indices: torch.Tensor | None,
+) -> torch.Tensor:
+    unsqueeze = x.dim() == 2
+    if unsqueeze:
+        x = x.unsqueeze(-1)
+    out = torch.ops._rocm_C.gdn_conv1d_update_rdna2(
+        x, weight, bias, conv_state, conv_state_indices
+    )
+    if unsqueeze:
+        out = out.squeeze(-1)
+    return out
+
+
+if hasattr(
+    torch.ops, "_rocm_C"
+) and hasattr(torch.ops._rocm_C, "gdn_conv1d_update_rdna2"):
+
+    @register_fake("_rocm_C::gdn_conv1d_update_rdna2")
+    def _gdn_conv1d_update_rdna2_fake(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        conv_state: torch.Tensor,
+        conv_state_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return torch.empty_like(x)
+
+
+def gdn_sigmoid_gating_delta_rule_update_rdna2(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    ssm_state_indices: torch.Tensor | None,
+    beta_d: float,
+    threshold_d: float,
+    scale_d: float,
+    inplace_final_state: bool,
+    use_qk_l2norm: bool,
+    o: torch.Tensor,
+    final_state: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.gdn_sigmoid_gating_delta_rule_update_rdna2(
+        A_log,
+        a,
+        b,
+        dt_bias,
+        q,
+        k,
+        v,
+        initial_state,
+        cu_seqlens,
+        ssm_state_indices,
+        beta_d,
+        threshold_d,
+        scale_d,
+        inplace_final_state,
+        use_qk_l2norm,
+        o,
+        final_state,
+    )
+
+
+if hasattr(
+    torch.ops, "_rocm_C"
+) and hasattr(
+    torch.ops._rocm_C, "gdn_sigmoid_gating_delta_rule_update_rdna2"
+):
+
+    @register_fake("_rocm_C::gdn_sigmoid_gating_delta_rule_update_rdna2")
+    def _gdn_sigmoid_gating_delta_rule_update_rdna2_fake(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        ssm_state_indices: torch.Tensor | None,
+        beta_d: float,
+        threshold_d: float,
+        scale_d: float,
+        inplace_final_state: bool,
+        use_qk_l2norm: bool,
+        o: torch.Tensor,
+        final_state: torch.Tensor,
+    ) -> None:
+        pass
+
+
 def gptq_gemm_rdna3(
     a: torch.Tensor,
     b_q_weight: torch.Tensor,
@@ -680,6 +836,61 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_r
 
     @register_fake("_rocm_C::moe_gptq_gemm_rdna3")
     def _moe_gptq_gemm_rdna3_fake(
+        a: torch.Tensor,
+        c: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_scales: torch.Tensor,
+        b_qzeros: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int = 0,
+    ) -> None:
+        return
+
+
+def moe_awq_gemm_rdna2(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int = 0,
+) -> None:
+    torch.ops._rocm_C.moe_awq_gemm_rdna2(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_qzeros,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_awq_gemm_rdna2"
+):
+
+    @register_fake("_rocm_C::moe_awq_gemm_rdna2")
+    def _moe_awq_gemm_rdna2_fake(
         a: torch.Tensor,
         c: torch.Tensor,
         b_q_weight: torch.Tensor,

@@ -52,6 +52,49 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 #endif  // VLLM_SKIP_SKINNY_GEMMS
 
+#ifdef VLLM_ROCM_GFX1030
+  // W4A16 GPTQ kernel for AMD RDNA2 (gfx1030).
+  rocm_ops.def(
+      "gptq_gemm_rdna2(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
+  rocm_ops.impl("gptq_gemm_rdna2", torch::kCUDA, &gptq_gemm_rdna2);
+
+  // W4A16 AWQ kernel for AMD RDNA2 (gfx1030), fp16 only, sequential layout.
+  rocm_ops.def(
+      "awq_gemm_rdna2(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales) -> Tensor");
+  rocm_ops.impl("awq_gemm_rdna2", torch::kCUDA, &awq_gemm_rdna2);
+
+  // GDN causal_conv1d_update for RDNA2 (gfx1030).
+  rocm_ops.def(
+      "gdn_conv1d_update_rdna2(Tensor x, Tensor weight, Tensor? bias, "
+      "Tensor conv_state, Tensor? conv_state_indices) -> Tensor");
+  rocm_ops.impl("gdn_conv1d_update_rdna2", torch::kCUDA,
+                &gdn_conv1d_update_rdna2);
+
+  // GDN sigmoid gating delta rule update for RDNA2 (gfx1030).
+  rocm_ops.def(
+      "gdn_sigmoid_gating_delta_rule_update_rdna2("
+      "Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, "
+      "Tensor q, Tensor k, Tensor v, Tensor initial_state, "
+      "Tensor? cu_seqlens, Tensor? ssm_state_indices, "
+      "float beta_d, float threshold_d, float scale_d, "
+      "bool inplace_final_state, bool use_qk_l2norm, "
+      "Tensor! o, Tensor! final_state) -> ()");
+  rocm_ops.impl("gdn_sigmoid_gating_delta_rule_update_rdna2", torch::kCUDA,
+                &gdn_sigmoid_gating_delta_rule_update_rdna2);
+
+  // Fused MoE W4A16 AWQ kernel for AMD RDNA2 (gfx1030).
+  rocm_ops.def(
+      "moe_awq_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "
+      "Tensor b_scales, Tensor b_qzeros, Tensor topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "int output_topk) -> ()");
+  rocm_ops.impl("moe_awq_gemm_rdna2", torch::kCUDA, &moe_awq_gemm_rdna2);
+#endif
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(

@@ -26,8 +26,8 @@
   #define __HIP__GFX9__
 #endif
 
-// Combined RDNA macro (gfx11 + gfx12) - both use 32-wide wavefronts
-#if defined(__GFX11__) || defined(__GFX12__)
+// Combined RDNA macro (gfx10 + gfx11 + gfx12) - all use 32-wide wavefronts
+#if defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
   #define __HIP__GFX1X__
 #endif
 
@@ -55,7 +55,8 @@ bool on_gfx1x() {
   static const bool result = [] {
     const auto* dprops = at::cuda::getCurrentDeviceProperties();
     const std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx11") != std::string::npos ||
+    return device_arch.find("gfx10") != std::string::npos ||
+           device_arch.find("gfx11") != std::string::npos ||
            device_arch.find("gfx12") != std::string::npos;
   }();
   return result;
