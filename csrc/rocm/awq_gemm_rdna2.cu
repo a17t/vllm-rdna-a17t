@@ -320,6 +320,110 @@ __global__ void gemv_awq_q4_rdna2(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Split-K partial GEMV: blockIdx.y = k-split index. Computes the dot product
+// over a K-slice [k_lo, k_hi) for BLOCK_N output columns and writes the fp32
+// partial to workspace[ks * size_n + n]. Each (ks, n) is owned by exactly one
+// thread -> no atomics. A second kernel sums the K_SPLITS partials.
+//
+// Used when the single-pass kernel would under-occupy the GPU (small N), which
+// is common under tensor parallelism where each rank computes N/TP outputs.
+// ---------------------------------------------------------------------------
+template <int BLOCK_N, int TILE_K>
+__global__ void gemv_awq_q4_split_rdna2(
+    const half* __restrict__ a,              // [K]
+    const uint32_t* __restrict__ b_q_weight, // [K, N/8]
+    const uint32_t* __restrict__ b_qzeros,   // [G, N/8]
+    const half* __restrict__ b_scales,       // [G, N]
+    float* __restrict__ workspace,           // [k_splits, N]
+    const int size_n, const int size_k, const int groups,
+    const int k_splits) {
+  static_assert(BLOCK_N % 8 == 0, "BLOCK_N must be a multiple of 8");
+  constexpr int WORDS_PER_ROW = BLOCK_N / 8;
+
+  const int tid = threadIdx.x;
+  const int blk_n = blockIdx.x * BLOCK_N;
+  const int n = blk_n + tid;
+  const int ks = blockIdx.y;
+  const int row_words = size_n / 8;
+  const int groupsize = size_k / groups;
+
+  // This split's K range; the last split absorbs the remainder.
+  const int per_split = size_k / k_splits;
+  const int k_lo = ks * per_split;
+  const int k_hi = (ks + 1 == k_splits) ? size_k : (ks + 1) * per_split;
+
+  extern __shared__ char smem[];
+  uint32_t* lds_w = reinterpret_cast<uint32_t*>(smem);
+  half* lds_a = reinterpret_cast<half*>(lds_w + TILE_K * WORDS_PER_ROW);
+
+  const int wd = tid / 8;
+  const int shft = (tid % 8) * 4;
+  const bool valid = n < size_n;
+
+  float z_f = 0.0f, y_f = 0.0f;
+  int cur_group = -1;
+  float acc = 0.0f;
+
+  for (int k0 = k_lo; k0 < k_hi; k0 += TILE_K) {
+    const int kk_end = (TILE_K < k_hi - k0) ? TILE_K : (k_hi - k0);
+    const int total_words = kk_end * WORDS_PER_ROW;
+    for (int idx = tid; idx < total_words; idx += BLOCK_N) {
+      const int kk = idx / WORDS_PER_ROW;
+      const int w = idx % WORDS_PER_ROW;
+      const int global_col_word = blk_n / 8 + w;
+      uint32_t wv = 0u;
+      if (global_col_word < row_words) {
+        wv = b_q_weight[(k0 + kk) * row_words + global_col_word];
+      }
+      lds_w[kk * WORDS_PER_ROW + w] = wv;
+    }
+    for (int kk = tid; kk < kk_end; kk += BLOCK_N) {
+      lds_a[kk] = a[k0 + kk];
+    }
+    __syncthreads();
+
+    if (valid) {
+      for (int kk = 0; kk < kk_end; ++kk) {
+        const int k = k0 + kk;
+        const int g = k / groupsize;
+        if (g != cur_group) {
+          const uint32_t qz = b_qzeros[g * row_words + (n / 8)];
+          const int zero = (qz >> shft) & 0xF;
+          prep_zero_scale_fp32(static_cast<uint32_t>(zero),
+                               b_scales[g * size_n + n], z_f, y_f);
+          cur_group = g;
+        }
+        const uint32_t wword = lds_w[kk * WORDS_PER_ROW + wd];
+        const int nibble = (wword >> shft) & 0xF;
+        const float w = __fmaf_rn(static_cast<float>(nibble), y_f, z_f);
+        const float av = __half2float(lds_a[kk]);
+        acc = __fmaf_rn(w, av, acc);
+      }
+    }
+    __syncthreads();
+  }
+
+  if (valid) {
+    workspace[ks * size_n + n] = acc;
+  }
+}
+
+// Reduce K_SPLITS fp32 partials per output column -> fp16 output.
+template <int BLOCK_N>
+__global__ void reduce_awq_q4_rdna2(const float* __restrict__ workspace,
+                                    half* __restrict__ c, const int size_n,
+                                    const int k_splits) {
+  const int tid = threadIdx.x;
+  const int n = blockIdx.x * BLOCK_N + tid;
+  if (n >= size_n) return;
+  float sum = 0.0f;
+  for (int ks = 0; ks < k_splits; ++ks) {
+    sum += workspace[ks * size_n + n];
+  }
+  c[n] = __float2half_rn(sum);
+}
+
 #else
 
 template <int M_COUNT>
@@ -332,6 +436,15 @@ template <int BLOCK_N, int TILE_K>
 __global__ void gemv_awq_q4_rdna2(const half*, const uint32_t*,
                                   const uint32_t*, const half*, half*,
                                   const int, const int, const int) {}
+
+template <int BLOCK_N, int TILE_K>
+__global__ void gemv_awq_q4_split_rdna2(const half*, const uint32_t*,
+                                        const uint32_t*, const half*, float*,
+                                        const int, const int, const int,
+                                        const int) {}
+
+template <int BLOCK_N>
+__global__ void reduce_awq_q4_rdna2(const float*, half*, const int, const int) {}
 
 #endif
 
@@ -357,25 +470,38 @@ void launch_awq_gemm_q4_for_mcount(const half* a, const uint32_t* b_q_weight,
 template <int BLOCK_N, int TILE_K>
 void launch_gemv_awq_q4(const half* a, const uint32_t* b_q_weight,
                         const uint32_t* b_qzeros, const half* b_scales,
-                        half* c, int size_n, int size_k, int groups,
-                        cudaStream_t stream) {
-  dim3 block(BLOCK_N);
-  dim3 grid((size_n + BLOCK_N - 1) / BLOCK_N);
+                        half* c, float* workspace, int k_splits, int size_n,
+                        int size_k, int groups, cudaStream_t stream) {
   constexpr int words_per_row = BLOCK_N / 8;
   const size_t smem = sizeof(uint32_t) * TILE_K * words_per_row +
                       sizeof(half) * TILE_K;
-  gemv_awq_q4_rdna2<BLOCK_N, TILE_K><<<grid, block, smem, stream>>>(
-      a, b_q_weight, b_qzeros, b_scales, c, size_n, size_k, groups);
+  const int n_blocks = (size_n + BLOCK_N - 1) / BLOCK_N;
+  if (k_splits <= 1) {
+    // Single-pass: each output owned by one block over the full K.
+    gemv_awq_q4_rdna2<BLOCK_N, TILE_K>
+        <<<dim3(n_blocks), BLOCK_N, smem, stream>>>(
+            a, b_q_weight, b_qzeros, b_scales, c, size_n, size_k, groups);
+  } else {
+    // Split-K: partials -> fp32 workspace, then reduce -> fp16 output.
+    gemv_awq_q4_split_rdna2<BLOCK_N, TILE_K>
+        <<<dim3(n_blocks, k_splits), BLOCK_N, smem, stream>>>(
+            a, b_q_weight, b_qzeros, b_scales, workspace, size_n, size_k,
+            groups, k_splits);
+    reduce_awq_q4_rdna2<BLOCK_N><<<n_blocks, BLOCK_N, 0, stream>>>(
+        workspace, c, size_n, k_splits);
+  }
 }
 
 void launch_awq_gemm_q4(const half* a, const uint32_t* b_q_weight,
                         const uint32_t* b_qzeros, const half* b_scales,
-                        half* c, int size_m, int size_n, int size_k,
-                        int groups, cudaStream_t stream) {
+                        half* c, float* workspace, int k_splits, int size_m,
+                        int size_n, int size_k, int groups,
+                        cudaStream_t stream) {
   if (size_m == 1) {
     // Dedicated decode GEMV: no atomic-CAS reduction, coalesced weight loads.
-    launch_gemv_awq_q4<256, 32>(a, b_q_weight, b_qzeros, b_scales, c, size_n,
-                                 size_k, groups, stream);
+    // Split-K is used only when N is too small to fill the GPU on its own.
+    launch_gemv_awq_q4<256, 32>(a, b_q_weight, b_qzeros, b_scales, c, workspace,
+                                 k_splits, size_n, size_k, groups, stream);
     return;
   } else if (size_m <= 3) {
     launch_awq_gemm_q4_for_mcount<2>(a, b_q_weight, b_qzeros, b_scales, c,
@@ -431,10 +557,35 @@ torch::Tensor awq_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   at::Tensor c = torch::zeros({size_m, size_n}, opts);
 
+  // Occupancy heuristic for the M=1 GEMV. The single-pass kernel has exactly
+  // N/BLOCK_N blocks; under tensor parallelism each rank computes N/TP outputs,
+  // which can leave the GPU under-occupied on small-N layers. Split K to raise
+  // the block count in that case (partials summed by a reduce kernel).
+  constexpr int GEMV_BLOCK_N = 256;
+  constexpr int GEMV_TARGET_BLOCKS = 128;  // ~saturates ~2x a 46-CU rank
+  constexpr int GEMV_MAX_SPLITS = 16;
+  int k_splits = 1;
+  if (size_m == 1) {
+    const int n_blocks = (size_n + GEMV_BLOCK_N - 1) / GEMV_BLOCK_N;
+    if (n_blocks < 32) {
+      k_splits = (GEMV_TARGET_BLOCKS + n_blocks - 1) / n_blocks;  // ceil
+      if (k_splits > GEMV_MAX_SPLITS) k_splits = GEMV_MAX_SPLITS;
+      if (k_splits > size_k) k_splits = size_k;
+      if (k_splits < 1) k_splits = 1;
+    }
+  }
+  at::Tensor workspace;
+  if (k_splits > 1) {
+    workspace = at::empty({k_splits, size_n},
+                          at::TensorOptions().dtype(at::kFloat).device(a.device()));
+  }
+
   vllm::awq_rdna2::launch_awq_gemm_q4(
       (const half*)a.data_ptr(), (const uint32_t*)b_q_weight.data_ptr(),
       (const uint32_t*)b_qzeros.data_ptr(), (const half*)b_scales.data_ptr(),
-      (half*)c.data_ptr(), size_m, size_n, size_k, groups, stream);
+      (half*)c.data_ptr(),
+      workspace.defined() ? workspace.data_ptr<float>() : nullptr, k_splits,
+      size_m, size_n, size_k, groups, stream);
 
   return c;
 }
