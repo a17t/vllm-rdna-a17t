@@ -3125,6 +3125,31 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
 
 #else
 
+// RDNA2 (gfx1030) — scalar FMA kernels (no MFMA/WMMA)
+// These replace the UNREACHABLE_CODE stubs with working implementations.
+
+template <typename T>
+__device__ __forceinline__ float to_float(const T& inp) {
+  if constexpr (std::is_same<T, _Float16>::value) {
+    return (float)inp;
+  } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
+    return __bfloat162float(inp);
+  } else {
+    static_assert(false, "unsupported 16b dtype");
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ T from_float(const float& inp) {
+  if constexpr (std::is_same<T, _Float16>::value) {
+    return (_Float16)inp;
+  } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
+    return __float2bfloat16(inp);
+  } else {
+    static_assert(false, "unsupported 16b dtype");
+  }
+}
+
 // clang-format off
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, typename OUTT, int BLOCK_SIZE,
@@ -3132,25 +3157,201 @@ template <typename scalar_t, typename cache_t,
           int GQA_RATIO, MFMAType MFMA_TYPE>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
-    const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
-    const cache_t* __restrict__ k_cache,    // [num_blocks, num_kv_heads, head_size/x, block_size, x]
-    const cache_t* __restrict__ v_cache,    // [num_blocks, num_kv_heads, head_size, block_size]
+    const scalar_t* __restrict__ q,
+    const cache_t* __restrict__ k_cache,
+    const cache_t* __restrict__ v_cache,
     const int num_kv_heads,
     const float scale,
-    const int* __restrict__ block_tables,    // [num_seqs, max_num_blocks_per_seq]
-    const int* __restrict__ seq_lens,    // [num_seqs]
-    const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_loc_ptr,
     const int max_num_blocks_per_seq,
-    const float* __restrict__ alibi_slopes,  // [num_heads]
+    const float* __restrict__ alibi_slopes,
     const int q_stride,
     const int kv_block_stride,
     const int kv_head_stride,
-    float* __restrict__ exp_sums,             // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits,           // [num_seqs, num_heads, max_num_partitions]
-    scalar_t* __restrict__ out,               // [num_seqs, num_heads, max_num_partitions, head_size]
-    OUTT* __restrict__ final_out,             // [num_seqs, num_heads, head_size]
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    scalar_t* __restrict__ out,
+    OUTT* __restrict__ final_out,
     int max_ctx_blocks, const float* k_scale, const float* v_scale) {
-  UNREACHABLE_CODE
+  // RDNA2 scalar-FMA implementation
+  // Use global WARP_SIZE from cuda_compat.h
+  constexpr int NWARPS = NUM_THREADS / WARP_SIZE;
+
+  const int tid = threadIdx.x;
+  const int warpid = tid / WARP_SIZE;
+  const int laneid = tid % WARP_SIZE;
+
+  const int seq_idx = blockIdx.x;
+  if (query_start_loc_ptr != nullptr &&
+      (query_start_loc_ptr[seq_idx + 1] - query_start_loc_ptr[seq_idx]) != 1) {
+    return;
+  }
+
+  const int partition_idx = blockIdx.y;
+  constexpr int T_PAR_SIZE = 256;
+  const int max_num_partitions = gridDim.y;
+  const int seq_len = seq_lens[seq_idx];
+  const int partition_start_token_idx = partition_idx * T_PAR_SIZE;
+
+  if (partition_start_token_idx >= seq_len) {
+    return;
+  }
+
+  __shared__ float shared_qk_max[NWARPS];
+  __shared__ float shared_exp_sum[NWARPS];
+
+  const int wg_start_head_idx = blockIdx.z * GQA_RATIO;
+  const int wg_start_kv_head_idx = blockIdx.z;
+  const int total_num_heads = gridDim.z * GQA_RATIO;
+
+  const int local_qhead_idx = laneid % GQA_RATIO;
+  const int global_qhead_idx = wg_start_head_idx + local_qhead_idx;
+
+  scalar_t q_reg[HEAD_SIZE];
+  const int64_t query_start_off =
+      static_cast<int64_t>(query_start_loc_ptr ? query_start_loc_ptr[seq_idx]
+                                               : seq_idx);
+  const scalar_t* q_ptr =
+      q + query_start_off * q_stride + global_qhead_idx * HEAD_SIZE;
+
+  if (laneid < GQA_RATIO) {
+    for (int he = 0; he < HEAD_SIZE; he++) {
+      q_reg[he] = q_ptr[he];
+    }
+  }
+
+  constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS;
+  __shared__ float shared_logits[GQA_RATIO][TOKENS_PER_WARP];
+
+  float my_qk_max = -FLT_MAX;
+  float my_exp_sum = 0.0f;
+
+  if (laneid < GQA_RATIO) {
+    const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
+    const cache_t* k_base = k_cache + wg_start_kv_head_idx * kv_head_stride;
+
+    for (int t_local = 0; t_local < TOKENS_PER_WARP; t_local++) {
+      const int global_token_idx =
+          partition_start_token_idx + warpid * TOKENS_PER_WARP + t_local;
+      float qk = 0.0f;
+
+      if (global_token_idx < seq_len) {
+        const int block_idx = global_token_idx / BLOCK_SIZE;
+        const int block_offset = global_token_idx % BLOCK_SIZE;
+        const int physical_block = block_table_seq[block_idx];
+        const cache_t* k_ptr = k_base + physical_block * kv_block_stride +
+                               block_offset * HEAD_SIZE;
+        for (int he = 0; he < HEAD_SIZE; he++) {
+          qk += to_float<scalar_t>(q_reg[he]) * to_float<scalar_t>(k_ptr[he]);
+        }
+        qk *= scale;
+        if (ALIBI_ENABLED && alibi_slopes) {
+          qk += alibi_slopes[global_qhead_idx] * global_token_idx;
+        }
+      } else {
+        qk = -FLT_MAX;
+      }
+
+      if (qk > my_qk_max) {
+        my_exp_sum = my_exp_sum * __expf(my_qk_max - qk) + 1.0f;
+        my_qk_max = qk;
+      } else {
+        my_exp_sum += __expf(qk - my_qk_max);
+      }
+      shared_logits[local_qhead_idx][t_local] = qk;
+    }
+  }
+  __syncthreads();
+
+  if (laneid == 0) {
+    shared_qk_max[warpid] = my_qk_max;
+    shared_exp_sum[warpid] = my_exp_sum;
+  }
+  __syncthreads();
+
+  float partition_qk_max = -FLT_MAX;
+  for (int w = 0; w < NWARPS; w++) {
+    if (shared_qk_max[w] > partition_qk_max) {
+      partition_qk_max = shared_qk_max[w];
+    }
+  }
+
+  float partition_exp_sum = 0.0f;
+  float my_rescale = 0.0f;
+  if (laneid == 0) {
+    float warp_exp_sum = 0.0f;
+    for (int w = 0; w < NWARPS; w++) {
+      float w_exp = shared_exp_sum[w] * __expf(shared_qk_max[w] - partition_qk_max);
+      warp_exp_sum += w_exp;
+    }
+    partition_exp_sum = warp_exp_sum;
+    my_rescale = __expf(my_qk_max - partition_qk_max) / (partition_exp_sum + 1e-6f);
+  }
+
+  __shared__ float shared_rescale;
+  if (laneid == 0) {
+    shared_rescale = my_rescale;
+  }
+  __syncthreads();
+  float rescale = shared_rescale;
+
+  if (laneid < GQA_RATIO) {
+    for (int t_local = 0; t_local < TOKENS_PER_WARP; t_local++) {
+      const int global_token_idx =
+          partition_start_token_idx + warpid * TOKENS_PER_WARP + t_local;
+      float logit = shared_logits[local_qhead_idx][t_local];
+      if (global_token_idx >= seq_len) {
+        shared_logits[local_qhead_idx][t_local] = 0.0f;
+      } else {
+        shared_logits[local_qhead_idx][t_local] =
+            __expf(logit - my_qk_max) * rescale;
+      }
+    }
+  }
+  __syncthreads();
+
+  float out_reg[HEAD_SIZE] = {0};
+  if (laneid < GQA_RATIO) {
+    const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
+    const cache_t* v_base = v_cache + wg_start_kv_head_idx * kv_head_stride;
+    for (int w = 0; w < NWARPS; w++) {
+      for (int t_local = 0; t_local < TOKENS_PER_WARP; t_local++) {
+        const int global_token_idx =
+            partition_start_token_idx + w * TOKENS_PER_WARP + t_local;
+        if (global_token_idx >= seq_len) continue;
+        const float s = shared_logits[local_qhead_idx][t_local];
+        if (s == 0.0f) continue;
+        const int block_idx = global_token_idx / BLOCK_SIZE;
+        const int block_offset = global_token_idx % BLOCK_SIZE;
+        const int physical_block = block_table_seq[block_idx];
+        const cache_t* v_ptr = v_base + physical_block * kv_block_stride +
+                               block_offset * HEAD_SIZE;
+        for (int he = 0; he < HEAD_SIZE; he++) {
+          out_reg[he] += s * to_float<scalar_t>(v_ptr[he]);
+        }
+      }
+    }
+  }
+
+  if (laneid < GQA_RATIO) {
+    const int hsz_maxp_mult = HEAD_SIZE * max_num_partitions;
+    scalar_t* out_ptr = out + seq_idx * total_num_heads * hsz_maxp_mult +
+                        partition_idx * HEAD_SIZE +
+                        global_qhead_idx * hsz_maxp_mult;
+    for (int he = 0; he < HEAD_SIZE; he++) {
+      out_ptr[he] = from_float<scalar_t>(out_reg[he]);
+    }
+  }
+
+  if (laneid < GQA_RATIO) {
+    const int offset = seq_idx * total_num_heads * max_num_partitions +
+                       global_qhead_idx * max_num_partitions +
+                       partition_idx;
+    max_logits[offset] = partition_qk_max;
+    exp_sums[offset] = partition_exp_sum;
+  }
 }
 
 template <typename scalar_t, typename cache_t,
@@ -3159,40 +3360,184 @@ template <typename scalar_t, typename cache_t,
           int GQA_RATIO>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
-    const scalar_t* __restrict__ q,          // [num_seqs, num_heads, head_size]
-    const cache_t* __restrict__ k_cache,     // [num_blocks, num_kv_heads, head_size/x, block_size, x]
-    const cache_t* __restrict__ v_cache,     // [num_blocks, num_kv_heads, head_size, block_size]
+    const scalar_t* __restrict__ q,
+    const cache_t* __restrict__ k_cache,
+    const cache_t* __restrict__ v_cache,
     const int num_kv_heads,
     const float scale,
-    const int* __restrict__ block_tables,    // [num_seqs, max_num_blocks_per_seq]
-    const int* __restrict__ seq_lens,    // [num_seqs]
-    const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_loc_ptr,
     const int max_num_blocks_per_seq,
-    const float* __restrict__ alibi_slopes,  // [num_heads]
+    const float* __restrict__ alibi_slopes,
     const int q_stride,
     const int kv_block_stride,
     const int kv_head_stride,
-    float* __restrict__ exp_sums,            // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits,          // [num_seqs, num_heads, max_num_partitions]
-    scalar_t* __restrict__ out,              // [num_seqs, num_heads, max_num_partitions, head_size]
-    OUTT* __restrict__ final_out,            // [num_seqs, num_heads, head_size]
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    scalar_t* __restrict__ out,
+    OUTT* __restrict__ final_out,
     int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+  // RDNA2: mfma4 not needed, use mfma16 for all GQA ratios
+  // This path should never be reached for RDNA2
   UNREACHABLE_CODE
 }
 
-// Grid: (num_heads, num_seqs).
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
           int PARTITION_SIZE, int NPAR_LOOPS>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
-    OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
-    const float* __restrict__ exp_sums,    // [num_seqs, num_heads, max_num_partitions]
-    const float* __restrict__ max_logits,  // [num_seqs, num_heads, max_num_partitions]
-    const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_heads, max_num_partitions, head_size]
-    const int* __restrict__ seq_lens,  // [num_seqs]
-    const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
+    OUTT* __restrict__ out,
+    const float* __restrict__ exp_sums,
+    const float* __restrict__ max_logits,
+    const scalar_t* __restrict__ tmp_out,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_loc_ptr,
     const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr) {
-  UNREACHABLE_CODE
+  // RDNA2 reduce kernel — same algorithm as gfx9 but wave32
+  // Use global WARP_SIZE from cuda_compat.h
+  const auto num_heads = gridDim.x;
+  const auto head_idx = blockIdx.x;
+  const auto seq_idx = blockIdx.y;
+
+  if (query_start_loc_ptr != nullptr &&
+      (query_start_loc_ptr[seq_idx + 1] - query_start_loc_ptr[seq_idx] != 1)) {
+    return;
+  }
+
+  const int seq_len = seq_lens[seq_idx];
+  const int num_partitions = DIVIDE_ROUND_UP(seq_len, PARTITION_SIZE);
+  const int warpid = threadIdx.x / WARP_SIZE;
+
+  __shared__ float shared_global_exp_sum;
+  __shared__ float shared_exp_sums[NPAR_LOOPS * WARP_SIZE];
+
+  if (warpid == 0) {
+    const float* max_logits_ptr = max_logits +
+                                  seq_idx * num_heads * max_num_partitions +
+                                  head_idx * max_num_partitions;
+
+    int valid_partition[NPAR_LOOPS];
+    float reg_max_logit[NPAR_LOOPS];
+    const int last_valid_partition = num_partitions - 1;
+
+    for (int i = 0; i < NPAR_LOOPS; i++) {
+      const int partition_no = i * WARP_SIZE + threadIdx.x;
+      valid_partition[i] =
+          (partition_no < num_partitions) ? partition_no : last_valid_partition;
+    }
+    for (int i = 0; i < NPAR_LOOPS; i++) {
+      reg_max_logit[i] = max_logits_ptr[valid_partition[i]];
+    }
+    float max_logit = reg_max_logit[0];
+    for (int i = 1; i < NPAR_LOOPS; i++) {
+      max_logit = fmaxf(max_logit, reg_max_logit[i]);
+    }
+
+    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+      max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+    }
+
+    const float* exp_sums_ptr = exp_sums +
+                                seq_idx * num_heads * max_num_partitions +
+                                head_idx * max_num_partitions;
+
+    float rescaled_exp_sum[NPAR_LOOPS];
+    for (int i = 0; i < NPAR_LOOPS; i++) {
+      rescaled_exp_sum[i] = exp_sums_ptr[valid_partition[i]];
+    }
+    for (int i = 0; i < NPAR_LOOPS; i++) {
+      const int partition_no = i * WARP_SIZE + threadIdx.x;
+      rescaled_exp_sum[i] *= (partition_no < num_partitions)
+                                 ? expf(reg_max_logit[i] - max_logit)
+                                 : 0.0f;
+    }
+    float global_exp_sum = rescaled_exp_sum[0];
+    for (int i = 1; i < NPAR_LOOPS; i++) {
+      global_exp_sum += rescaled_exp_sum[i];
+    }
+    for (int i = 0; i < NPAR_LOOPS; i++) {
+      const int partition_no = i * WARP_SIZE + threadIdx.x;
+      shared_exp_sums[partition_no] = rescaled_exp_sum[i];
+    }
+
+    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+      global_exp_sum += __shfl_xor(global_exp_sum, mask);
+    }
+    if (threadIdx.x == 0) {
+      shared_global_exp_sum = global_exp_sum;
+    }
+  }
+  __syncthreads();
+
+  const scalar_t* tmp_out_ptr =
+      tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+      head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
+  constexpr int MAX_NPAR = 32;
+  scalar_t tmps[MAX_NPAR];
+  const float dzero = 0.0f;
+  for (int j = 0; j < MAX_NPAR; j++) {
+    tmps[j] = from_float<scalar_t>(dzero);
+  }
+  const int last_partition_offset = (num_partitions - 1) * HEAD_SIZE;
+  const int num_partition_offset = (num_partitions) * HEAD_SIZE;
+  int idx = 0;
+
+  constexpr int JCHUNK = 16;
+
+  for (int j = 0; j < JCHUNK * HEAD_SIZE; j += HEAD_SIZE) {
+    const int lastj_offset =
+        (j < num_partition_offset) ? j : last_partition_offset;
+    tmps[idx] = tmp_out_ptr[lastj_offset];
+    idx++;
+  }
+  __syncthreads();
+
+  if (num_partitions > JCHUNK) {
+    for (int j = JCHUNK * HEAD_SIZE; j < 2 * JCHUNK * HEAD_SIZE;
+         j += HEAD_SIZE) {
+      const int lastj_offset =
+          (j < num_partition_offset) ? j : last_partition_offset;
+      tmps[idx] = tmp_out_ptr[lastj_offset];
+      idx++;
+    }
+
+    if (num_partitions > 2 * JCHUNK) {
+      for (int j = 2 * JCHUNK * HEAD_SIZE; j < MAX_NPAR * HEAD_SIZE;
+           j += HEAD_SIZE) {
+        const int lastj_offset =
+            (j < num_partition_offset) ? j : last_partition_offset;
+        tmps[idx] = tmp_out_ptr[lastj_offset];
+        idx++;
+      }
+    }
+  }
+
+  // Aggregate tmp_out to out (same algorithm as gfx9 reduce kernel)
+  float acc = 0.0f;
+  for (int j = 0; j < JCHUNK; j++) {
+    acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
+  }
+  if (num_partitions > JCHUNK) {
+    for (int j = JCHUNK; j < 2 * JCHUNK; j++) {
+      acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
+    }
+    if (num_partitions > 2 * JCHUNK) {
+      for (int j = 2 * JCHUNK; j < MAX_NPAR; j++) {
+        acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
+      }
+    }
+  }
+
+  const float inv_global_exp_sum =
+      __fdividef(1.0f, shared_global_exp_sum + 1e-6f);
+  acc *= inv_global_exp_sum;
+
+  const int64_t query_start_off = static_cast<int64_t>(
+      query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx);
+  OUTT* out_ptr = out + query_start_off * num_heads * HEAD_SIZE +
+                  static_cast<int64_t>(head_idx) * HEAD_SIZE;
+  out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
 }
 // clang-format on
 
@@ -3552,22 +3897,200 @@ void paged_attention_custom_launcher_navi(
       break;
     default:
       TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);
+       break;
+  }
+}
+
+// RDNA2 launcher — uses mfma16 for ALL GQA ratios (no mfma4 on gfx10)
+template <typename T, typename KVT, vllm::Fp8KVCacheDataType KV_DTYPE,
+          int BLOCK_SIZE, int HEAD_SIZE, typename OUTT, int PARTITION_SIZE_OLD,
+          bool ALIBI_ENABLED, MFMAType MFMA_TYPE>
+void paged_attention_custom_launcher_rdna2(
+    torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
+    torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, const int num_kv_heads, float scale,
+    torch::Tensor& block_tables, torch::Tensor& seq_lens,
+    const std::optional<torch::Tensor>& query_start_loc, int max_seq_len,
+    const std::optional<torch::Tensor>& alibi_slopes, torch::Tensor& k_scale,
+    torch::Tensor& v_scale) {
+  int num_seqs = block_tables.size(0);
+  int num_heads = query.size(1);
+  int head_size = query.size(2);
+  int max_num_blocks_per_seq = block_tables.size(1);
+  int q_stride = query.stride(0);
+  int kv_block_stride = key_cache.stride(0);
+  int kv_head_stride = key_cache.stride(1);
+
+  const int* query_start_loc_ptr =
+      query_start_loc
+          ? reinterpret_cast<const int*>(query_start_loc.value().data_ptr())
+          : nullptr;
+
+  const float* alibi_slopes_ptr =
+      alibi_slopes
+          ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
+          : nullptr;
+
+  float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
+  float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());
+  T* tmp_out_ptr = reinterpret_cast<T*>(tmp_out.data_ptr());
+  T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
+  KVT* key_cache_ptr = reinterpret_cast<KVT*>(key_cache.data_ptr());
+  KVT* value_cache_ptr = reinterpret_cast<KVT*>(value_cache.data_ptr());
+  int* block_tables_ptr = block_tables.data_ptr<int>();
+  int* seq_lens_ptr = seq_lens.data_ptr<int>();
+  const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
+  const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
+  const auto fp8_out_scale_ptr = nullptr;
+  OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
+
+  const int max_ctx_blocks = DIVIDE_ROUND_UP(max_seq_len, BLOCK_SIZE);
+
+  constexpr int PARTITION_SIZE = 256;
+  const int max_num_partitions = DIVIDE_ROUND_UP(max_seq_len, PARTITION_SIZE);
+  const int gqa_ratio = num_heads / num_kv_heads;
+  assert(num_heads % num_kv_heads == 0);
+  assert(head_size == HEAD_SIZE);
+
+  constexpr int NTHR = 256;
+  dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+  dim3 block(NTHR);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // RDNA2: mfma16 for ALL GQA ratios (no mfma4)
+  switch (gqa_ratio) {
+    case 1:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(1);
+      break;
+    case 2:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(2);
+      break;
+    case 3:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(3);
+      break;
+    case 4:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(4);
+      break;
+    case 5:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(5);
+      break;
+    case 6:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(6);
+      break;
+    case 7:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(7);
+      break;
+    case 8:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(8);
+      break;
+    case 9:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(9);
+      break;
+    case 10:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(10);
+      break;
+    case 11:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(11);
+      break;
+    case 12:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(12);
+      break;
+    case 13:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(13);
+      break;
+    case 14:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(14);
+      break;
+    case 15:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(15);
+      break;
+    case 16:
+      LAUNCH_CUSTOM_ATTENTION_MFMA16(16);
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio);
+      break;
+  }
+
+  dim3 reduce_grid(num_heads, num_seqs);
+  dim3 reduce_block(head_size);
+  const int warp_size = 32;
+  const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warp_size);
+  switch (npar_loops) {
+    case 1:
+      LAUNCH_CUSTOM_REDUCTION(1);
+      break;
+    case 2:
+      LAUNCH_CUSTOM_REDUCTION(2);
+      break;
+    case 3:
+      LAUNCH_CUSTOM_REDUCTION(3);
+      break;
+    case 4:
+      LAUNCH_CUSTOM_REDUCTION(4);
+      break;
+    case 5:
+      LAUNCH_CUSTOM_REDUCTION(5);
+      break;
+    case 6:
+      LAUNCH_CUSTOM_REDUCTION(6);
+      break;
+    case 7:
+      LAUNCH_CUSTOM_REDUCTION(7);
+      break;
+    case 8:
+      LAUNCH_CUSTOM_REDUCTION(8);
+      break;
+    case 9:
+      LAUNCH_CUSTOM_REDUCTION(9);
+      break;
+    case 10:
+      LAUNCH_CUSTOM_REDUCTION(10);
+      break;
+    case 11:
+      LAUNCH_CUSTOM_REDUCTION(11);
+      break;
+    case 12:
+      LAUNCH_CUSTOM_REDUCTION(12);
+      break;
+    case 13:
+      LAUNCH_CUSTOM_REDUCTION(13);
+      break;
+    case 14:
+      LAUNCH_CUSTOM_REDUCTION(14);
+      break;
+    case 15:
+      LAUNCH_CUSTOM_REDUCTION(15);
+      break;
+    case 16:
+      LAUNCH_CUSTOM_REDUCTION(16);
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);
       break;
   }
 }
 
 #define CALL_CUSTOM_LAUNCHER(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT,   \
-                             PSIZE, ALIBI_ENABLED, MFMA_TYPE)               \
-  if (!is_navi) {                                                           \
+                              PSIZE, ALIBI_ENABLED, MFMA_TYPE)               \
+  if (is_rdna2) {                                                           \
+    paged_attention_custom_launcher_rdna2<                                  \
+        T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE,                 \
+        ALIBI_ENABLED, MFMA_TYPE>(                                          \
+        out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
+        num_kv_heads, scale, block_tables, seq_lens, query_start_loc,       \
+        max_seq_len, alibi_slopes, k_scale, v_scale);                       \
+  } else if (!is_navi) {                                                    \
     paged_attention_custom_launcher<T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE,  \
-                                    OUTT, PSIZE, ALIBI_ENABLED, MFMA_TYPE>( \
+                                     OUTT, PSIZE, ALIBI_ENABLED, MFMA_TYPE>( \
         out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
         num_kv_heads, scale, block_tables, seq_lens, query_start_loc,       \
         max_seq_len, alibi_slopes, k_scale, v_scale, fp8_out_scale);        \
   } else {                                                                  \
     paged_attention_custom_launcher_navi<T, KVT, KV_DTYPE, BLK_SIZE,        \
-                                         HEAD_SIZE, OUTT, PSIZE,            \
-                                         ALIBI_ENABLED, MFMA_TYPE>(         \
+                                          HEAD_SIZE, OUTT, PSIZE,            \
+                                          ALIBI_ENABLED, MFMA_TYPE>(         \
         out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
         num_kv_heads, scale, block_tables, seq_lens, query_start_loc,       \
         max_seq_len, alibi_slopes, k_scale, v_scale);                       \
@@ -3648,6 +4171,24 @@ bool is_navi_gpu() {
   return result;
 }
 
+bool is_rdna2_gpu() {
+  static bool is_cached = false;
+  static bool result;
+
+  if (!is_cached) {
+    int device_id;
+    hipDeviceProp_t deviceProp;
+    hipGetDevice(&device_id);
+    hipGetDeviceProperties(&deviceProp, device_id);
+
+    std::string arch = deviceProp.gcnArchName;
+    result = arch.find("gfx10") == 0;
+    is_cached = true;
+  }
+
+  return result;
+}
+
 // clang-format off
 void paged_attention(
     torch::Tensor& out,         // [num_seqs, num_heads, head_size]
@@ -3670,6 +4211,7 @@ void paged_attention(
     const std::string& mfma_type) {
   // clang-format on
   bool is_navi = is_navi_gpu();
+  bool is_rdna2 = is_rdna2_gpu();
   const int head_size = query.size(2);
   if (kv_cache_dtype == "auto") {
     if (query.dtype() == at::ScalarType::Half) {
