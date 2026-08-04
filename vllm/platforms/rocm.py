@@ -219,6 +219,7 @@ _ON_GFX11 = "gfx11" in _GCN_ARCH
 _ON_GFX1100 = "gfx1100" in _GCN_ARCH
 _ON_GFX1151 = "gfx1151" in _GCN_ARCH
 _ON_GFX12X = any(arch in _GCN_ARCH for arch in ["gfx12"])
+_ON_GFX10X = "gfx10" in _GCN_ARCH
 _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
 _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 _ON_GFX90A = "gfx90a" in _GCN_ARCH
@@ -305,6 +306,10 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
 
 def on_gfx1x() -> bool:
     return _ON_GFX1X and not _ON_CDNA
+
+
+def on_gfx10x() -> bool:
+    return _ON_GFX10X
 
 
 def on_gfx11() -> bool:
@@ -407,6 +412,20 @@ def use_rocm_custom_paged_attention(
             and sinks is None
         )
 
+    elif _ON_GFX10X:
+        # RDNA2 native paged-attention kernel: head_size 64/128, block 16/32,
+        # GQA 1-16.
+        return (
+            (sliding_window == 0 or sliding_window == (-1, -1))
+            and (qtype == torch.half or qtype == torch.bfloat16)
+            and (head_size == 64 or head_size == 128)
+            and (block_size == 16 or block_size == 32)
+            and (gqa_ratio >= 1 and gqa_ratio <= 16)
+            and max_seq_len <= 128 * 1024
+            and kv_cache_dtype == "auto"
+            and sinks is None
+        )
+
     else:
         return (
             _ON_GFX1X
@@ -424,7 +443,7 @@ def use_rocm_custom_paged_attention(
 
 @cache
 def flash_attn_triton_available() -> bool:
-    if not on_gfx1x():
+    if not (on_gfx1x() or on_gfx10x()):
         return False
     try:
         from importlib.util import find_spec
@@ -757,9 +776,9 @@ class RocmPlatform(Platform):
             logger.info_once("Using Flash Attention backend for ViT model.")
             return AttentionBackendEnum.FLASH_ATTN
 
-        # RDNA3/RDNA4 (gfx11xx/gfx12xx): Use Flash Attention Triton backend
+        # RDNA2/RDNA3/RDNA4 (gfx10xx/gfx11xx/gfx12xx): Flash Attention Triton
         if (
-            on_gfx1x()
+            (on_gfx1x() or on_gfx10x())
             and flash_attn_triton_available()
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
@@ -767,6 +786,15 @@ class RocmPlatform(Platform):
                 "Using Flash Attention (Triton backend) for ViT model on RDNA."
             )
             return AttentionBackendEnum.FLASH_ATTN
+        # Triton prefill attention uses tiled/blocked computation, avoiding the
+        # N^2 memory allocation that TORCH_SDPA's "math" backend triggers on
+        # ROCm devices without efficient SDPA kernels.
+        if dtype == torch.float16 or dtype == torch.bfloat16:
+            logger.info_once(
+                "No efficient SDPA backend available; using Triton attention "
+                "for ViT model to avoid N^2 memory allocation."
+            )
+            return AttentionBackendEnum.TRITON_ATTN
 
         logger.info_once("Using Torch SDPA backend for ViT model.")
         return AttentionBackendEnum.TORCH_SDPA
