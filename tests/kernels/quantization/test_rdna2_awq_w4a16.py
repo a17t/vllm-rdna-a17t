@@ -30,27 +30,26 @@ def has_rdna2():
 
 @pytest.fixture(scope="module")
 def has_awq_op():
-    return (
-        hasattr(torch.ops, "_rocm_C")
-        and hasattr(torch.ops._rocm_C, "awq_gemm_rdna2")
+    return hasattr(torch.ops, "_rocm_C") and hasattr(
+        torch.ops._rocm_C, "awq_gemm_rdna2"
     )
 
 
 TEST_CASES = [
     # (M, K, N, group_size)
-    (1, 1152, 1152, 128),   # Qwen3.5-0.8B decode
-    (1, 4096, 4096, 128),   # typical decode
-    (1, 1152, 3072, 128),   # qkv projection
-    (8, 1152, 1152, 128),   # small prefill
+    (1, 1152, 1152, 128),  # Qwen3.5-0.8B decode
+    (1, 4096, 4096, 128),  # typical decode
+    (1, 1152, 3072, 128),  # qkv projection
+    (8, 1152, 1152, 128),  # small prefill
     (32, 1152, 1152, 128),  # medium prefill
-    (128, 1152, 1152, 128), # large prefill
-    (1, 4096, 1024, 64),    # different group size
-    (1, 4096, 4096, 256),   # different group size
-    (1, 1024, 2048, 128),   # rectangular
-    (1, 2048, 1024, 128),   # rectangular inverse
-    (1, 256, 256, 64),      # K div by groupsize, tail loop exercises K=248..255
-    (1, 128, 256, 128),     # K == groupsize, single group, no tail
-    (1, 256, 256, 128),     # K = 2*groupsize, 2 groups, no tail
+    (128, 1152, 1152, 128),  # large prefill
+    (1, 4096, 1024, 64),  # different group size
+    (1, 4096, 4096, 256),  # different group size
+    (1, 1024, 2048, 128),  # rectangular
+    (1, 2048, 1024, 128),  # rectangular inverse
+    (1, 256, 256, 64),  # K div by groupsize, tail loop exercises K=248..255
+    (1, 128, 256, 128),  # K == groupsize, single group, no tail
+    (1, 256, 256, 128),  # K = 2*groupsize, 2 groups, no tail
 ]
 
 
@@ -84,7 +83,9 @@ def _make_random_quantized(K, N, group_size, device):
 
 @pytest.mark.skipif(not on_gfx10x(), reason="Requires RDNA2 (gfx1030)")
 @pytest.mark.skipif(
-    not (hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "awq_gemm_rdna2")),
+    not (
+        hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "awq_gemm_rdna2")
+    ),
     reason="awq_gemm_rdna2 op not available",
 )
 class TestRDNA2AWQCorrectness:
@@ -126,11 +127,14 @@ class TestRDNA2AWQCorrectness:
             f"(threshold=0.05)"
         )
 
-    @pytest.mark.parametrize("M,K,N,group_size", [
-        (1, 1152, 1152, 128),
-        (1, 4096, 4096, 128),
-        (32, 4096, 4096, 128),
-    ])
+    @pytest.mark.parametrize(
+        "M,K,N,group_size",
+        [
+            (1, 1152, 1152, 128),
+            (1, 4096, 4096, 128),
+            (32, 4096, 4096, 128),
+        ],
+    )
     def test_awq_numerical_sanity(self, M, K, N, group_size, device):
         """Verify output is not all-zeros and has reasonable magnitude."""
         w_packed, z_packed, scales = _make_random_quantized(K, N, group_size, device)

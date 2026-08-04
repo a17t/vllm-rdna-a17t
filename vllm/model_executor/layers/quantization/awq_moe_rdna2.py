@@ -128,7 +128,9 @@ class AWQMoERDNA2Method(FusedMoEMethodBase):
         # Transpose to [E, K, N] then pack N into int32
         unpacked = unpacked.permute(0, 2, 1)  # [E, K, N]
         unpacked = unpacked.reshape(E, K, N // 8, 8)
-        shifts = torch.tensor([0, 4, 8, 12, 16, 20, 24, 28], dtype=torch.int32, device=device)
+        shifts = torch.tensor(
+            [0, 4, 8, 12, 16, 20, 24, 28], dtype=torch.int32, device=device
+        )
         w13_int32 = (unpacked << shifts).sum(dim=3, dtype=torch.int32)
 
         layer.w13_qweight = torch.nn.Parameter(w13_int32, requires_grad=False)
@@ -182,7 +184,8 @@ class AWQMoERDNA2Method(FusedMoEMethodBase):
             layer.w13_qzeros = torch.nn.Parameter(w13_z_int32, requires_grad=False)
 
         if hasattr(layer, "w2_qzeros") and layer.w2_qzeros.numel() > 0:
-            w2_z_uint8 = layer.w2_qzeros  # [E, hidden_size//2, intermediate//group_size]
+            # [E, hidden_size//2, intermediate//group_size]
+            w2_z_uint8 = layer.w2_qzeros
             E, N_half, G = w2_z_uint8.shape
             N_full = N_half * 2  # hidden_size
 
