@@ -53,8 +53,10 @@ class RDNA2AWQLinearKernel(MPLinearKernel):
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
             return (
                 False,
-                f"Quant type ({c.weight_type}) not supported; "
-                f"supported: {cls.SUPPORTED_QUANT_TYPES}",
+                (
+                    f"Quant type ({c.weight_type}) not supported; "
+                    f"supported: {cls.SUPPORTED_QUANT_TYPES}"
+                ),
             )
 
         if c.act_type != torch.float16:
@@ -70,17 +72,18 @@ class RDNA2AWQLinearKernel(MPLinearKernel):
         if c.has_g_idx:
             return (
                 False,
-                "Activation reordering (g_idx) is not supported by "
-                "RDNA2 AWQ kernel",
+                "Activation reordering (g_idx) is not supported by RDNA2 AWQ kernel",
             )
 
         gs = c.group_size
         if gs not in [-1, 32, 64, 128, 256] and gs != c.full_weight_shape[0]:
             return (
                 False,
-                f"Group size {gs} not supported; "
-                f"supported: [-1, 32, 64, 128, 256] "
-                f"or full K ({c.full_weight_shape[0]})",
+                (
+                    f"Group size {gs} not supported; "
+                    "supported: [-1, 32, 64, 128, 256] "
+                    f"or full K ({c.full_weight_shape[0]})"
+                ),
             )
 
         K = c.partition_weight_shape[0]
@@ -91,24 +94,42 @@ class RDNA2AWQLinearKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Repack weights from checkpoint layout to kernel layout [K, N//8]."""
+        """Repack weights from checkpoint layout to kernel layout [K, N//8].
+
+        Done in tiles over N to bound scratch memory: the naive version
+        materializes an ``[N, K]`` int32 unpack + transpose (~33x the packed
+        weight) which OOMs on large layers during loading.
+        """
 
         def repack_w_q(x: BasevLLMParameter) -> BasevLLMParameter:
             permute_param_layout_(x, input_dim=1, output_dim=0, packed_dim=1)
-            w = x.data  # [N, K//8] int32
+            w = x.data  # [N, K//8] int32 (8 consecutive K nibbles per word)
 
             N_dim, K8 = w.shape
             K_dim = K8 * 8
-            shifts = torch.arange(8, device=w.device, dtype=torch.int32) * 4
-            w_unpacked = ((w.unsqueeze(-1) >> shifts) & 0xF).reshape(N_dim, K_dim)
-            w_KN = w_unpacked.t().contiguous()
             N8 = N_dim // 8
-            w_repacked = torch.sum(
-                (w_KN.view(K_dim, N8, 8) & 0xF) << shifts,
-                dim=2,
-                dtype=torch.int32,
-            )
-            x.data = w_repacked.contiguous()
+            shifts = torch.arange(8, device=w.device, dtype=torch.int32) * 4
+            out = torch.empty((K_dim, N8), dtype=torch.int32, device=w.device)
+
+            # CHUNK must be a multiple of 8 (and N is already a multiple of 8,
+            # ensured by can_implement), so every chunk packs to whole words.
+            CHUNK = 512
+            for n0 in range(0, N_dim, CHUNK):
+                n1 = min(n0 + CHUNK, N_dim)
+                wc = w[n0:n1, :]  # [c, K//8] view
+                uc = ((wc.unsqueeze(-1) >> shifts) & 0xF).reshape(
+                    n1 - n0, K_dim
+                )  # [c, K] int32 (small: only one tile)
+                kc = uc.t().contiguous()  # [K, c] int32
+                c8 = (n1 - n0) // 8
+                packed = torch.sum(
+                    (kc.view(K_dim, c8, 8) & 0xF) << shifts,
+                    dim=2,
+                    dtype=torch.int32,
+                )  # [K, c//8] int32
+                out[:, n0 // 8 : n0 // 8 + c8] = packed
+
+            x.data = out
             return x
 
         def repack_w_s(x: BasevLLMParameter) -> BasevLLMParameter:

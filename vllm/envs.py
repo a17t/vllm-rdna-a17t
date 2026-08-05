@@ -133,6 +133,10 @@ if TYPE_CHECKING:
     # (gdn_conv1d_update_rdna2 / gdn_sigmoid_gating_delta_rule_update_rdna2).
     # Set to 0 to force the generic packed-recurrent path.
     VLLM_RDNA2_NATIVE_GDN: bool = True
+    # RDNA2: route AutoAWQ dense linears through the native awq_gemm_rdna2
+    # kernel via the MPLinear chooser. Set to 0 to use the Triton AWQ path
+    # (lower weight-load memory, no repack).
+    VLLM_RDNA2_NATIVE_AWQ: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1220,6 +1224,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_RDNA2_NATIVE_GDN": lambda: bool(
         int(os.getenv("VLLM_RDNA2_NATIVE_GDN", "1"))
+    ),
+    "VLLM_RDNA2_NATIVE_AWQ": lambda: bool(
+        int(os.getenv("VLLM_RDNA2_NATIVE_AWQ", "1"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

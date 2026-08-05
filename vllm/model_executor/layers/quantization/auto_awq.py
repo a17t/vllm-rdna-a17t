@@ -306,7 +306,8 @@ class AutoAWQConfig(QuantizationConfig):
 
             # On RDNA2 (gfx1030), route through the MPLinear chooser so the
             # native awq_gemm_rdna2 kernel (RDNA2AWQLinearKernel) is used.
-            if current_platform.is_rocm():
+            # Set VLLM_RDNA2_NATIVE_AWQ=0 to keep the Triton AWQ path.
+            if current_platform.is_rocm() and envs.VLLM_RDNA2_NATIVE_AWQ:
                 from vllm.platforms.rocm import on_gfx10x
 
                 if on_gfx10x():
