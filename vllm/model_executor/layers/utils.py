@@ -126,7 +126,8 @@ def rocm_unquantized_gemm_impl(
     # generic skinny GEMM (wvSplitK/LLMM1) uses gfx11/12 ISA that traps on
     # gfx10, and torch.nn.functional.linear runs at ~9% MBU here.
     if (
-        on_gfx10x()
+        envs.VLLM_RDNA2_FP16_GEMV
+        and on_gfx10x()
         and n == 1
         and x.dtype in [torch.float16, torch.bfloat16]
         and k % 8 == 0

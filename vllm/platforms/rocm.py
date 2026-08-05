@@ -412,7 +412,7 @@ def use_rocm_custom_paged_attention(
             and sinks is None
         )
 
-    elif _ON_GFX10X:
+    elif _ON_GFX10X and envs.VLLM_RDNA2_NATIVE_PAGED_ATTN:
         # RDNA2 native paged-attention kernel: head_size 64/128, block 16/32,
         # GQA 1-16.
         return (

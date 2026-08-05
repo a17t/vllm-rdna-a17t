@@ -138,6 +138,12 @@ if TYPE_CHECKING:
     # weight repack raises load memory, and AWQ is not the decode bottleneck
     # (the Triton AWQ path is equally fast). Set to 1 to enable for validation.
     VLLM_RDNA2_NATIVE_AWQ: bool = False
+    # RDNA2: use the Triton fp16 GEMV (rdna2_gemv) for M=1 unquantized
+    # projections. Set to 0 to fall back to torch.nn.functional.linear.
+    VLLM_RDNA2_FP16_GEMV: bool = True
+    # RDNA2: use the native paged-attention kernel for full_attention layers.
+    # Set to 0 to use the reference attention backend.
+    VLLM_RDNA2_NATIVE_PAGED_ATTN: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1228,6 +1234,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_RDNA2_NATIVE_AWQ": lambda: bool(
         int(os.getenv("VLLM_RDNA2_NATIVE_AWQ", "0"))
+    ),
+    "VLLM_RDNA2_FP16_GEMV": lambda: bool(
+        int(os.getenv("VLLM_RDNA2_FP16_GEMV", "1"))
+    ),
+    "VLLM_RDNA2_NATIVE_PAGED_ATTN": lambda: bool(
+        int(os.getenv("VLLM_RDNA2_NATIVE_PAGED_ATTN", "1"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
