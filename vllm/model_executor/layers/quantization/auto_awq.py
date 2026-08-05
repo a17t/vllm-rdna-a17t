@@ -304,6 +304,14 @@ class AutoAWQConfig(QuantizationConfig):
             if current_platform.is_cpu() or current_platform.is_xpu():
                 return AutoAWQMarlinLinearMethod(self)
 
+            # On RDNA2 (gfx1030), route through the MPLinear chooser so the
+            # native awq_gemm_rdna2 kernel (RDNA2AWQLinearKernel) is used.
+            if current_platform.is_rocm():
+                from vllm.platforms.rocm import on_gfx10x
+
+                if on_gfx10x():
+                    return AutoAWQMarlinLinearMethod(self)
+
             # Check if Marlin is supported and not using batch invariant mode
             # (Marlin kernels are not batch invariant)
             use_marlin = (
@@ -421,7 +429,16 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
 
         # Skip Marlin verification on CPU/XPU - they use dedicated WNA16
         # kernels (CPUWNA16LinearKernel / XPUwNa16LinearKernel) instead.
-        if not (current_platform.is_cpu() or current_platform.is_xpu()):
+        # Also skip on RDNA2 (gfx1030): the chooser selects RDNA2AWQLinearKernel
+        # (native awq_gemm_rdna2), not Marlin, so Marlin support is irrelevant.
+        skip_marlin_check = (
+            current_platform.is_cpu() or current_platform.is_xpu()
+        )
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx10x
+
+            skip_marlin_check = skip_marlin_check or on_gfx10x()
+        if not skip_marlin_check:
             verify_marlin_supported(
                 quant_type=self.quant_config.quant_type,
                 group_size=self.quant_config.group_size,

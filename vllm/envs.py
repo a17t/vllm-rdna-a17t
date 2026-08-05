@@ -129,6 +129,10 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    # RDNA2: use the native GDN decode kernels by default when available
+    # (gdn_conv1d_update_rdna2 / gdn_sigmoid_gating_delta_rule_update_rdna2).
+    # Set to 0 to force the generic packed-recurrent path.
+    VLLM_RDNA2_NATIVE_GDN: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1213,6 +1217,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "cuda",
         ["cuda", "triton"],
         case_sensitive=False,
+    ),
+    "VLLM_RDNA2_NATIVE_GDN": lambda: bool(
+        int(os.getenv("VLLM_RDNA2_NATIVE_GDN", "1"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

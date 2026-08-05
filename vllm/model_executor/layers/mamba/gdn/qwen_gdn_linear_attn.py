@@ -587,6 +587,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.gdn_decode_kernel = "triton"
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+        # On RDNA2 the native GDN decode kernels are used by default (when the
+        # ops are present and not explicitly disabled), which bypasses the
+        # packed-recurrent short-circuit so the _rdna2_* branches in
+        # _forward_core are reached.
+        self.use_native_rdna2_gdn = (
+            _GDN_RDNA2_CONV1D_AVAILABLE
+            and _GDN_RDNA2_SIGMOID_AVAILABLE
+            and envs.VLLM_RDNA2_NATIVE_GDN
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1353,6 +1362,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         if (
             self.enable_packed_recurrent_decode
+            and not self.use_native_rdna2_gdn
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
