@@ -116,11 +116,25 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx10x, on_gfx950, on_gfx1250
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
     k = weight.shape[1]
+
+    # RDNA2 (gfx1030): dedicated Triton GEMV for the decode (M=1) path. The
+    # generic skinny GEMM (wvSplitK/LLMM1) uses gfx11/12 ISA that traps on
+    # gfx10, and torch.nn.functional.linear runs at ~9% MBU here.
+    if (
+        on_gfx10x()
+        and n == 1
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and k % 8 == 0
+    ):
+        from vllm.model_executor.layers.rdna2_gemm import rdna2_gemv
+
+        out = rdna2_gemv(x.reshape(-1), weight, bias)
+        return out.reshape(*x.shape[:-1], weight.shape[0])
 
     cu_count = num_compute_units()
 
