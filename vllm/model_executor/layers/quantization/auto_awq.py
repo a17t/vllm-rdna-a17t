@@ -115,16 +115,24 @@ def _convert_awq_to_standard_format(
     K, N_packed = qw.shape
     N = N_packed * pack_factor
 
-    # Unpack int32 → individual values, fix AWQ ordering
-    unpacked = (qw.unsqueeze(-1) >> shifts) & mask  # (K, N_packed, pack_factor)
-    unpacked = unpacked[:, :, reverse_order]
-    unpacked = unpacked.reshape(K, N)  # (K, N)
-
-    # Repack along input dim (dim 0)
-    unpacked = unpacked.reshape(K // pack_factor, pack_factor, N)
-    new_qw = (unpacked.to(torch.int32) << shifts[None, :, None]).sum(
-        dim=1, dtype=torch.int32
-    )
+    # Unpack int32 → individual values, fix AWQ ordering, and repack along the
+    # input dim -- done in tiles over K so the full [K, N] int32 grid is never
+    # materialized (the naive version peaks at ~8x the packed weight per layer,
+    # which OOMs large AWQ models during loading).
+    new_qw = torch.empty((K // pack_factor, N), dtype=torch.int32, device=device)
+    # CHUNK must be a multiple of pack_factor; K is already a multiple of it.
+    # Small chunk keeps the per-layer scratch low so the caching allocator
+    # reserves little (vllm sizes the KV cache from free memory).
+    CHUNK_QW = max(pack_factor, 128)
+    for k0 in range(0, K, CHUNK_QW):
+        k1 = min(k0 + CHUNK_QW, K)
+        qc = qw[k0:k1, :]  # [c, N_packed]
+        uc = ((qc.unsqueeze(-1) >> shifts) & mask)[:, :, reverse_order]
+        uc = uc.reshape(k1 - k0, N)  # [c, N]
+        uc = uc.reshape((k1 - k0) // pack_factor, pack_factor, N)
+        new_qw[k0 // pack_factor : k1 // pack_factor, :] = (
+            uc.to(torch.int32) << shifts[None, :, None]
+        ).sum(dim=1, dtype=torch.int32)
 
     def _noop_loader(*args, **kwargs):
         pass
