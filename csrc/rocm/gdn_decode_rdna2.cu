@@ -543,6 +543,158 @@ torch::Tensor gdn_conv1d_update_rdna2(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Ragged conv1d update for spec-decode: variable-length sequences in one launch.
+// Each block processes one sequence; its length comes from query_start_loc.
+// No host sync, no Python loop -> CUDA-graph compatible.
+// ---------------------------------------------------------------------------
+template <bool HAS_BIAS>
+__global__ void conv1d_update_ragged_kernel_fp16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w,
+    const __half* __restrict__ bias,
+    __half* __restrict__ conv_state,
+    const int32_t* __restrict__ conv_state_indices,
+    const int32_t* __restrict__ query_start_loc,
+    __half* __restrict__ o,
+    int batch, int dim, int state_len, int num_cache_lines,
+    int stride_x_token, int stride_x_dim,
+    int stride_o_token, int stride_o_dim,
+    int stride_cs_seq, int stride_cs_dim, int stride_cs_tok,
+    int stride_w_dim, int stride_w_width) {
+
+    int idx_seq = blockIdx.x;
+    if (idx_seq >= batch) return;
+
+    int cache_idx = 0;
+    if (conv_state_indices) cache_idx = conv_state_indices[idx_seq];
+    if (cache_idx == 0) return;  // null block
+
+    int seq_start = query_start_loc[idx_seq];
+    int seqlen = query_start_loc[idx_seq + 1] - seq_start;
+
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+
+    for (int d = tid; d < dim; d += total_threads) {
+        __half* cs_d =
+            conv_state + cache_idx * stride_cs_seq + d * stride_cs_dim;
+        const __half* x_d =
+            x + seq_start * stride_x_token + d * stride_x_dim;
+        __half* o_d =
+            o + seq_start * stride_o_token + d * stride_o_dim;
+        const __half* w_d = w + d * stride_w_dim;
+
+        float col0 = __half2float(cs_d[0 * stride_cs_tok]);
+        float col1 = __half2float(cs_d[1 * stride_cs_tok]);
+        float col2 = __half2float(cs_d[2 * stride_cs_tok]);
+
+        float w0 = __half2float(w_d[0 * stride_w_width]);
+        float w1 = __half2float(w_d[1 * stride_w_width]);
+        float w2 = __half2float(w_d[2 * stride_w_width]);
+        float w3 = __half2float(w_d[3 * stride_w_width]);
+
+        float acc_base = HAS_BIAS ? __half2float(bias[d]) : 0.0f;
+
+        float new_state[16];
+        for (int t = 0; t < state_len; t++) {
+            int src = t + seqlen;
+            if (src < state_len) {
+                new_state[t] = __half2float(cs_d[src * stride_cs_tok]);
+            } else {
+                int x_tok = t - (state_len - seqlen);
+                new_state[t] =
+                    (x_tok >= 0 && x_tok < seqlen)
+                        ? __half2float(x_d[x_tok * stride_x_token])
+                        : 0.0f;
+            }
+        }
+        for (int t = 0; t < state_len; t++)
+            cs_d[t * stride_cs_tok] = __float2half_rn(new_state[t]);
+
+        for (int token = 0; token < seqlen; token++) {
+            float x_new = __half2float(x_d[token * stride_x_token]);
+            float acc =
+                acc_base + col0 * w0 + col1 * w1 + col2 * w2 + x_new * w3;
+            acc = acc / (1.0f + expf(-acc));
+            o_d[token * stride_o_token] = __float2half_rn(acc);
+            float new_col0 = col1;
+            float new_col1 = col2;
+            col2 = x_new;
+            col0 = new_col0;
+            col1 = new_col1;
+        }
+    }
+}
+
+torch::Tensor gdn_conv1d_update_spec_rdna2(
+    torch::Tensor x,
+    torch::Tensor weight,
+    const std::optional<torch::Tensor>& bias,
+    torch::Tensor conv_state,
+    torch::Tensor conv_state_indices,
+    torch::Tensor query_start_loc) {
+
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [total_tokens, dim]");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(conv_state.is_cuda(), "conv_state must be a CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be fp16");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int batch = (int)query_start_loc.size(0) - 1;
+    int dim = (int)x.size(1);
+    int width = (int)weight.size(1);
+    int state_len = (int)conv_state.size(2);
+
+    TORCH_CHECK(dim == weight.size(0), "dim mismatch");
+    TORCH_CHECK(width == 4, "Only KERNEL_WIDTH=4 supported");
+
+    bool has_bias = bias.has_value() && bias->numel() > 0;
+    at::Tensor out = x.clone();
+
+    int threads = 256;
+    dim3 grid(batch);
+
+    if (has_bias) {
+        vllm::gdn_rdna2::conv1d_update_ragged_kernel_fp16<true>
+            <<<grid, threads, 0, stream>>>(
+                (const __half*)x.data_ptr(),
+                (const __half*)weight.data_ptr(),
+                (const __half*)bias->data_ptr(),
+                (__half*)conv_state.data_ptr(),
+                (const int32_t*)conv_state_indices.data_ptr(),
+                (const int32_t*)query_start_loc.data_ptr(),
+                (__half*)out.data_ptr(),
+                batch, dim, state_len, (int)conv_state.size(0),
+                (int)x.stride(0), (int)x.stride(1),
+                (int)out.stride(0), (int)out.stride(1),
+                (int)conv_state.stride(0), (int)conv_state.stride(1),
+                (int)conv_state.stride(2),
+                (int)weight.stride(0), (int)weight.stride(1));
+    } else {
+        vllm::gdn_rdna2::conv1d_update_ragged_kernel_fp16<false>
+            <<<grid, threads, 0, stream>>>(
+                (const __half*)x.data_ptr(),
+                (const __half*)weight.data_ptr(),
+                nullptr,
+                (__half*)conv_state.data_ptr(),
+                (const int32_t*)conv_state_indices.data_ptr(),
+                (const int32_t*)query_start_loc.data_ptr(),
+                (__half*)out.data_ptr(),
+                batch, dim, state_len, (int)conv_state.size(0),
+                (int)x.stride(0), (int)x.stride(1),
+                (int)out.stride(0), (int)out.stride(1),
+                (int)conv_state.stride(0), (int)conv_state.stride(1),
+                (int)conv_state.stride(2),
+                (int)weight.stride(0), (int)weight.stride(1));
+    }
+
+    return out;
+}
+
 void gdn_sigmoid_gating_delta_rule_update_rdna2(
     torch::Tensor A_log,
     torch::Tensor a,

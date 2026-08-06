@@ -180,39 +180,17 @@ def _rdna2_conv1d_update_spec(
     conv_state_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> torch.Tensor:
-    """Multi-token spec-decode conv1d via per-position native calls.
+    """Single-launch ragged conv1d for spec-decode via native HIP kernel.
 
-    The native kernel handles a uniform seqlen per sequence, but spec decode
-    has variable-length ragged sequences. Process position-by-position: for
-    each token position, extract active sequences, call the native single-token
-    conv1d_update (which updates conv_state in-place). Sequential positions see
-    the updated state. Output preserves the input's ragged token ordering.
+    Handles variable-length sequences in one GPU launch (no host sync, no
+    Python loop) -- CUDA-graph compatible. Each sequence's length comes from
+    query_start_loc.
     """
     from vllm import _custom_ops as _gdn_ops
 
-    num_seqs = query_start_loc.shape[0] - 1
-    if num_seqs == 0:
-        return x
-
-    out = torch.empty_like(x)
-    lengths = query_start_loc[1:] - query_start_loc[:-1]
-    max_tokens = int(lengths.max().item())
-
-    for pos in range(max_tokens):
-        active = lengths > pos
-        if not active.any():
-            continue
-        active_seqs = torch.nonzero(active, as_tuple=False).squeeze(-1)
-        token_idxs = query_start_loc[active_seqs] + pos
-        state_idxs = conv_state_indices[active_seqs]
-
-        token_x = x[token_idxs]
-        token_out = _gdn_ops.gdn_conv1d_update_rdna2(
-            token_x, weight, bias, conv_state, state_idxs
-        )
-        out[token_idxs] = token_out
-
-    return out
+    return _gdn_ops.gdn_conv1d_update_spec_rdna2(
+        x, weight, bias, conv_state, conv_state_indices, query_start_loc
+    )
 
 
 def _rdna2_sigmoid_gating_spec(
@@ -1538,26 +1516,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
-        # NOTE: native conv1d not used for spec path — the per-position Python
-        # loop uses .item() and dynamic control flow, which is incompatible with
-        # CUDA graph capture (hipErrorStreamCaptureUnsupported). The spec path
-        # needs a HIP kernel that handles ragged batches natively. Use reference.
         if spec_sequence_masks is not None:
             assert spec_state_indices_tensor is not None
-            mixed_qkv_spec = causal_conv1d_update(
-                mixed_qkv_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][  # type: ignore[index]
-                    : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
-                validate_data=False,
-            )
+            spec_csi = spec_state_indices_tensor[:, 0][  # type: ignore[index]
+                : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
+            ]
+            if _GDN_RDNA2_CONV1D_AVAILABLE:
+                mixed_qkv_spec = _rdna2_conv1d_update_spec(
+                    mixed_qkv_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    spec_csi,
+                    spec_query_start_loc[
+                        : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
+                        + 1
+                    ],
+                )
+            else:
+                mixed_qkv_spec = causal_conv1d_update(
+                    mixed_qkv_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=spec_csi,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=spec_query_start_loc,
+                    max_query_len=spec_state_indices_tensor.size(-1),
+                    validate_data=False,
+                )
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:

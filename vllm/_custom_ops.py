@@ -686,6 +686,35 @@ if hasattr(
         return torch.empty_like(x)
 
 
+def gdn_conv1d_update_spec_rdna2(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    conv_state_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.gdn_conv1d_update_spec_rdna2(
+        x, weight, bias, conv_state, conv_state_indices, query_start_loc
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "gdn_conv1d_update_spec_rdna2"
+):
+
+    @register_fake("_rocm_C::gdn_conv1d_update_spec_rdna2")
+    def _gdn_conv1d_update_spec_rdna2_fake(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        conv_state: torch.Tensor,
+        conv_state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty_like(x)
+
+
 def gdn_sigmoid_gating_delta_rule_update_rdna2(
     A_log: torch.Tensor,
     a: torch.Tensor,

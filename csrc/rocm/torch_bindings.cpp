@@ -72,6 +72,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gdn_conv1d_update_rdna2", torch::kCUDA,
                 &gdn_conv1d_update_rdna2);
 
+  // GDN ragged conv1d_update for RDNA2 spec-decode (variable-length sequences).
+  rocm_ops.def(
+      "gdn_conv1d_update_spec_rdna2(Tensor x, Tensor weight, Tensor? bias, "
+      "Tensor conv_state, Tensor conv_state_indices, Tensor query_start_loc) "
+      "-> Tensor");
+  rocm_ops.impl("gdn_conv1d_update_spec_rdna2", torch::kCUDA,
+                &gdn_conv1d_update_spec_rdna2);
+
   // GDN sigmoid gating delta rule update for RDNA2 (gfx1030).
   rocm_ops.def(
       "gdn_sigmoid_gating_delta_rule_update_rdna2("
