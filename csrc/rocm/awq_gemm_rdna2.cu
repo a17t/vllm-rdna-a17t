@@ -242,6 +242,10 @@ __global__ void gemm_awq_q4_kernel_rdna2(
 //
 // Weight layout (AWQ): b_q_weight[K, N/8] int32, 8 consecutive N nibbles/word.
 // ---------------------------------------------------------------------------
+// Packed-fp16 GEMV: each thread owns TWO adjacent output columns, reads ONE
+// weight word (which holds both nibbles), dequant+MAC as half2, accumulates in
+// fp32. This halves LDS word reads vs thread-per-column and doubles FMA
+// throughput on RDNA2 (packed fp16 at full rate).
 template <int BLOCK_N, int TILE_K>
 __global__ void gemv_awq_q4_rdna2(
     const half* __restrict__ a,             // [K]
@@ -252,33 +256,41 @@ __global__ void gemv_awq_q4_rdna2(
     const int size_n, const int size_k, const int groups) {
   static_assert(BLOCK_N % 8 == 0, "BLOCK_N must be a multiple of 8");
   constexpr int WORDS_PER_ROW = BLOCK_N / 8;  // int32 words per K-row/block
+  constexpr int THREADS = BLOCK_N / 2;        // 2 output columns per thread
 
   const int tid = threadIdx.x;
   const int blk_n = blockIdx.x * BLOCK_N;     // first column owned by this block
-  const int n = blk_n + tid;                   // this thread's output column
-  const int row_words = size_n / 8;            // words per full K-row
+  const int n0 = blk_n + tid * 2;             // this thread's two columns
+  const int n1 = n0 + 1;
+  const int row_words = size_n / 8;           // words per full K-row
   const int groupsize = size_k / groups;
 
-  // Shared-memory tiles: weight words [TILE_K][WORDS_PER_ROW] + acts [TILE_K].
+  // 4 threads share each int32 word; each extracts an adjacent nibble pair.
+  const int wd = tid / 4;        // word index within this block
+  const int lane = tid % 4;
+  const int shift0 = lane * 8;
+  const int shift1 = lane * 8 + 4;
+  // n0 and n1 always share a word (n0 % 8 in {0,2,4,6}).
+
   extern __shared__ char smem[];
   uint32_t* lds_w = reinterpret_cast<uint32_t*>(smem);
   half* lds_a = reinterpret_cast<half*>(lds_w + TILE_K * WORDS_PER_ROW);
 
-  const int wd = tid / 8;        // word index within this block
-  const int shft = (tid % 8) * 4;  // nibble shift for this column
-  const bool valid = n < size_n;
+  const bool valid0 = n0 < size_n;
+  const bool valid1 = n1 < size_n;
 
-  // Per-column dequant constants (refreshed on group change): w = nib*y_f + z_f.
-  float z_f = 0.0f, y_f = 0.0f;
+  // Per-column-pair dequant constants (refreshed on group change).
+  half2 scale_h2 = __floats2half2_rn(0.0f, 0.0f);
+  half2 z_h2 = __floats2half2_rn(0.0f, 0.0f);
   int cur_group = -1;
-  float acc = 0.0f;
+  float acc0 = 0.0f, acc1 = 0.0f;
 
   for (int k0 = 0; k0 < size_k; k0 += TILE_K) {
     const int kk_end = (TILE_K < size_k - k0) ? TILE_K : (size_k - k0);
 
     // Cooperative coalesced load of the weight tile + activation tile.
     const int total_words = kk_end * WORDS_PER_ROW;
-    for (int idx = tid; idx < total_words; idx += BLOCK_N) {
+    for (int idx = tid; idx < total_words; idx += THREADS) {
       const int kk = idx / WORDS_PER_ROW;
       const int w = idx % WORDS_PER_ROW;
       const int global_col_word = blk_n / 8 + w;
@@ -288,36 +300,45 @@ __global__ void gemv_awq_q4_rdna2(
       }
       lds_w[kk * WORDS_PER_ROW + w] = wv;
     }
-    for (int kk = tid; kk < kk_end; kk += BLOCK_N) {
+    for (int kk = tid; kk < kk_end; kk += THREADS) {
       lds_a[kk] = a[k0 + kk];
     }
     __syncthreads();
 
-    // Each thread accumulates its own output column over the tile.
-    if (valid) {
+    if (valid0) {
       for (int kk = 0; kk < kk_end; ++kk) {
         const int k = k0 + kk;
         const int g = k / groupsize;
         if (g != cur_group) {
-          const uint32_t qz = b_qzeros[g * row_words + (n / 8)];
-          const int zero = (qz >> shft) & 0xF;
-          prep_zero_scale_fp32(static_cast<uint32_t>(zero),
-                               b_scales[g * size_n + n], z_f, y_f);
+          const uint32_t qz = b_qzeros[g * row_words + (n0 / 8)];
+          const int z0i = (qz >> shift0) & 0xF;
+          const int z1i = (qz >> shift1) & 0xF;
+          const float s0 = __half2float(b_scales[g * size_n + n0]);
+          const float s1 =
+              valid1 ? __half2float(b_scales[g * size_n + n1]) : s0;
+          // w = nibble*scale - zero*scale  =>  nibble*y + z,  z = -zero*scale
+          scale_h2 = __floats2half2_rn(s0, s1);
+          z_h2 = __floats2half2_rn(-(float)z0i * s0, -(float)z1i * s1);
           cur_group = g;
         }
         const uint32_t wword = lds_w[kk * WORDS_PER_ROW + wd];
-        const int nibble = (wword >> shft) & 0xF;
-        const float w = __fmaf_rn(static_cast<float>(nibble), y_f, z_f);
-        const float av = __half2float(lds_a[kk]);
-        acc = __fmaf_rn(w, av, acc);
+        const int nb0 = (wword >> shift0) & 0xF;
+        const int nb1 = (wword >> shift1) & 0xF;
+        const half2 nib_h2 =
+            __floats2half2_rn(static_cast<float>(nb0), static_cast<float>(nb1));
+        const half2 w_h2 = __hfma2(nib_h2, scale_h2, z_h2);  // dequant both
+        const half av = lds_a[kk];
+        const half2 prod_h2 = __hmul2(w_h2, __halves2half2(av, av));
+        const float2 pf = __half22float2(prod_h2);
+        acc0 += pf.x;
+        if (valid1) acc1 += pf.y;
       }
     }
     __syncthreads();  // before next tile load
   }
 
-  if (valid) {
-    c[n] = __float2half_rn(acc);
-  }
+  if (valid0) c[n0] = __float2half_rn(acc0);
+  if (valid1) c[n1] = __float2half_rn(acc1);
 }
 
 // ---------------------------------------------------------------------------
@@ -340,10 +361,12 @@ __global__ void gemv_awq_q4_split_rdna2(
     const int k_splits) {
   static_assert(BLOCK_N % 8 == 0, "BLOCK_N must be a multiple of 8");
   constexpr int WORDS_PER_ROW = BLOCK_N / 8;
+  constexpr int THREADS = BLOCK_N / 2;  // packed: 2 output columns per thread
 
   const int tid = threadIdx.x;
   const int blk_n = blockIdx.x * BLOCK_N;
-  const int n = blk_n + tid;
+  const int n0 = blk_n + tid * 2;
+  const int n1 = n0 + 1;
   const int ks = blockIdx.y;
   const int row_words = size_n / 8;
   const int groupsize = size_k / groups;
@@ -357,18 +380,22 @@ __global__ void gemv_awq_q4_split_rdna2(
   uint32_t* lds_w = reinterpret_cast<uint32_t*>(smem);
   half* lds_a = reinterpret_cast<half*>(lds_w + TILE_K * WORDS_PER_ROW);
 
-  const int wd = tid / 8;
-  const int shft = (tid % 8) * 4;
-  const bool valid = n < size_n;
+  const int wd = tid / 4;
+  const int lane = tid % 4;
+  const int shift0 = lane * 8;
+  const int shift1 = lane * 8 + 4;
+  const bool valid0 = n0 < size_n;
+  const bool valid1 = n1 < size_n;
 
-  float z_f = 0.0f, y_f = 0.0f;
+  half2 scale_h2 = __floats2half2_rn(0.0f, 0.0f);
+  half2 z_h2 = __floats2half2_rn(0.0f, 0.0f);
   int cur_group = -1;
-  float acc = 0.0f;
+  float acc0 = 0.0f, acc1 = 0.0f;
 
   for (int k0 = k_lo; k0 < k_hi; k0 += TILE_K) {
     const int kk_end = (TILE_K < k_hi - k0) ? TILE_K : (k_hi - k0);
     const int total_words = kk_end * WORDS_PER_ROW;
-    for (int idx = tid; idx < total_words; idx += BLOCK_N) {
+    for (int idx = tid; idx < total_words; idx += THREADS) {
       const int kk = idx / WORDS_PER_ROW;
       const int w = idx % WORDS_PER_ROW;
       const int global_col_word = blk_n / 8 + w;
@@ -378,35 +405,44 @@ __global__ void gemv_awq_q4_split_rdna2(
       }
       lds_w[kk * WORDS_PER_ROW + w] = wv;
     }
-    for (int kk = tid; kk < kk_end; kk += BLOCK_N) {
+    for (int kk = tid; kk < kk_end; kk += THREADS) {
       lds_a[kk] = a[k0 + kk];
     }
     __syncthreads();
 
-    if (valid) {
+    if (valid0) {
       for (int kk = 0; kk < kk_end; ++kk) {
         const int k = k0 + kk;
         const int g = k / groupsize;
         if (g != cur_group) {
-          const uint32_t qz = b_qzeros[g * row_words + (n / 8)];
-          const int zero = (qz >> shft) & 0xF;
-          prep_zero_scale_fp32(static_cast<uint32_t>(zero),
-                               b_scales[g * size_n + n], z_f, y_f);
+          const uint32_t qz = b_qzeros[g * row_words + (n0 / 8)];
+          const int z0i = (qz >> shift0) & 0xF;
+          const int z1i = (qz >> shift1) & 0xF;
+          const float s0 = __half2float(b_scales[g * size_n + n0]);
+          const float s1 =
+              valid1 ? __half2float(b_scales[g * size_n + n1]) : s0;
+          scale_h2 = __floats2half2_rn(s0, s1);
+          z_h2 = __floats2half2_rn(-(float)z0i * s0, -(float)z1i * s1);
           cur_group = g;
         }
         const uint32_t wword = lds_w[kk * WORDS_PER_ROW + wd];
-        const int nibble = (wword >> shft) & 0xF;
-        const float w = __fmaf_rn(static_cast<float>(nibble), y_f, z_f);
-        const float av = __half2float(lds_a[kk]);
-        acc = __fmaf_rn(w, av, acc);
+        const int nb0 = (wword >> shift0) & 0xF;
+        const int nb1 = (wword >> shift1) & 0xF;
+        const half2 nib_h2 =
+            __floats2half2_rn(static_cast<float>(nb0), static_cast<float>(nb1));
+        const half2 w_h2 = __hfma2(nib_h2, scale_h2, z_h2);
+        const half av = lds_a[kk];
+        const half2 prod_h2 = __hmul2(w_h2, __halves2half2(av, av));
+        const float2 pf = __half22float2(prod_h2);
+        acc0 += pf.x;
+        if (valid1) acc1 += pf.y;
       }
     }
     __syncthreads();
   }
 
-  if (valid) {
-    workspace[ks * size_n + n] = acc;
-  }
+  if (valid0) workspace[ks * size_n + n0] = acc0;
+  if (valid1) workspace[ks * size_n + n1] = acc1;
 }
 
 // Reduce K_SPLITS fp32 partials per output column -> fp16 output.
@@ -477,14 +513,14 @@ void launch_gemv_awq_q4(const half* a, const uint32_t* b_q_weight,
                       sizeof(half) * TILE_K;
   const int n_blocks = (size_n + BLOCK_N - 1) / BLOCK_N;
   if (k_splits <= 1) {
-    // Single-pass: each output owned by one block over the full K.
+    // Single-pass (packed fp16, 2 cols/thread): BLOCK_N/2 threads.
     gemv_awq_q4_rdna2<BLOCK_N, TILE_K>
-        <<<dim3(n_blocks), BLOCK_N, smem, stream>>>(
+        <<<dim3(n_blocks), BLOCK_N / 2, smem, stream>>>(
             a, b_q_weight, b_qzeros, b_scales, c, size_n, size_k, groups);
   } else {
-    // Split-K: partials -> fp32 workspace, then reduce -> fp16 output.
+    // Split-K (packed fp16, 2 cols/thread): partials -> workspace, then reduce.
     gemv_awq_q4_split_rdna2<BLOCK_N, TILE_K>
-        <<<dim3(n_blocks, k_splits), BLOCK_N, smem, stream>>>(
+        <<<dim3(n_blocks, k_splits), BLOCK_N / 2, smem, stream>>>(
             a, b_q_weight, b_qzeros, b_scales, workspace, size_n, size_k,
             groups, k_splits);
     reduce_awq_q4_rdna2<BLOCK_N><<<n_blocks, BLOCK_N, 0, stream>>>(
