@@ -452,6 +452,52 @@ __global__ void gemv_awq_q4_split_rdna2(
   if (valid) workspace[ks * size_n + n] = acc;
 }
 
+// Direct-global-read GEMV (no LDS, no barriers). For M=1 there is no weight
+// reuse, so the LDS staging of the other variants is pure overhead (a
+// global->LDS->register double-hop plus __syncthreads). Each thread reads its
+// column's weight words straight from global memory; 8 adjacent threads share
+// one int32 word, so the reads still coalesce into one broadcast transaction
+// per word -- same global traffic as the cooperative load, minus the LDS
+// write/read/sync. fp32 dequant+MAC.
+template <int BLOCK_N>
+__global__ void gemv_awq_q4_direct_rdna2(
+    const half* __restrict__ a,             // [K]
+    const uint32_t* __restrict__ b_q_weight,// [K, N/8]
+    const uint32_t* __restrict__ b_qzeros,  // [G, N/8]
+    const half* __restrict__ b_scales,      // [G, N]
+    half* __restrict__ c,                   // [N]
+    const int size_n, const int size_k, const int groups) {
+  const int tid = threadIdx.x;
+  const int blk_n = blockIdx.x * BLOCK_N;
+  const int n = blk_n + tid;
+  if (n >= size_n) return;
+  const int row_words = size_n / 8;
+  const int wd = n / 8;            // global word index for this column
+  const int shft = (n % 8) * 4;    // nibble shift for this column
+  const int groupsize = size_k / groups;
+
+  float z_f = 0.0f, y_f = 0.0f;
+  int cur_group = -1;
+  float acc = 0.0f;
+
+  for (int k = 0; k < size_k; ++k) {
+    const int g = k / groupsize;
+    if (g != cur_group) {
+      const uint32_t qz = b_qzeros[g * row_words + wd];
+      const int zero = (qz >> shft) & 0xF;
+      prep_zero_scale_fp32(static_cast<uint32_t>(zero),
+                           b_scales[g * size_n + n], z_f, y_f);
+      cur_group = g;
+    }
+    const uint32_t wword = b_q_weight[k * row_words + wd];  // direct global
+    const int nibble = (wword >> shft) & 0xF;
+    const float w = __fmaf_rn(static_cast<float>(nibble), y_f, z_f);
+    const float av = __half2float(a[k]);                     // direct (broadcast)
+    acc = __fmaf_rn(w, av, acc);
+  }
+  c[n] = __float2half_rn(acc);
+}
+
 // Reduce K_SPLITS fp32 partials per output column -> fp16 output.
 template <int BLOCK_N>
 __global__ void reduce_awq_q4_rdna2(const float* __restrict__ workspace,
@@ -488,6 +534,11 @@ __global__ void gemv_awq_q4_split_rdna2(const half*, const uint32_t*,
 
 template <int BLOCK_N>
 __global__ void reduce_awq_q4_rdna2(const float*, half*, const int, const int) {}
+
+template <int BLOCK_N>
+__global__ void gemv_awq_q4_direct_rdna2(const half*, const uint32_t*,
+                                         const uint32_t*, const half*, half*,
+                                         const int, const int, const int) {}
 
 #endif
 
@@ -542,10 +593,13 @@ void launch_awq_gemm_q4(const half* a, const uint32_t* b_q_weight,
                         int size_n, int size_k, int groups,
                         cudaStream_t stream) {
   if (size_m == 1) {
-    // Dedicated decode GEMV: no atomic-CAS reduction, coalesced weight loads.
-    // Split-K is used only when N is too small to fill the GPU on its own.
-    launch_gemv_awq_q4<256, 32>(a, b_q_weight, b_qzeros, b_scales, c, workspace,
-                                 k_splits, size_n, size_k, groups, stream);
+    // Direct-global-read decode GEMV (no LDS, no barriers). For M=1 there is no
+    // weight reuse, so staging through LDS is pure overhead.
+    constexpr int DIRECT_BLOCK_N = 256;
+    const int n_blocks = (size_n + DIRECT_BLOCK_N - 1) / DIRECT_BLOCK_N;
+    gemv_awq_q4_direct_rdna2<DIRECT_BLOCK_N>
+        <<<dim3(n_blocks), DIRECT_BLOCK_N, 0, stream>>>(
+            a, b_q_weight, b_qzeros, b_scales, c, size_n, size_k, groups);
     return;
   } else if (size_m <= 3) {
     launch_awq_gemm_q4_for_mcount<2>(a, b_q_weight, b_qzeros, b_scales, c,
@@ -601,28 +655,12 @@ torch::Tensor awq_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   at::Tensor c = torch::zeros({size_m, size_n}, opts);
 
-  // Occupancy heuristic for the M=1 GEMV. The single-pass kernel has exactly
-  // N/BLOCK_N blocks; under tensor parallelism each rank computes N/TP outputs,
-  // which can leave the GPU under-occupied on small-N layers. Split K to raise
-  // the block count in that case (partials summed by a reduce kernel).
-  constexpr int GEMV_BLOCK_N = 256;
-  constexpr int GEMV_TARGET_BLOCKS = 128;  // ~saturates ~2x a 46-CU rank
-  constexpr int GEMV_MAX_SPLITS = 16;
+  // M=1 uses the direct-global-read GEMV (no split-K, no workspace).
+  // The split-K heuristic + workspace below only applies to M>=2 paths.
   int k_splits = 1;
-  if (size_m == 1) {
-    const int n_blocks = (size_n + GEMV_BLOCK_N - 1) / GEMV_BLOCK_N;
-    if (n_blocks < 32) {
-      k_splits = (GEMV_TARGET_BLOCKS + n_blocks - 1) / n_blocks;  // ceil
-      if (k_splits > GEMV_MAX_SPLITS) k_splits = GEMV_MAX_SPLITS;
-      if (k_splits > size_k) k_splits = size_k;
-      if (k_splits < 1) k_splits = 1;
-    }
-  }
   at::Tensor workspace;
-  if (k_splits > 1) {
-    workspace = at::empty({k_splits, size_n},
-                          at::TensorOptions().dtype(at::kFloat).device(a.device()));
-  }
+  (void)k_splits;       // currently unused (M=1 is direct; M>=2 ignores k_splits)
+  (void)workspace;      // kept for API stability of the launcher signature
 
   vllm::awq_rdna2::launch_awq_gemm_q4(
       (const half*)a.data_ptr(), (const uint32_t*)b_q_weight.data_ptr(),
