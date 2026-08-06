@@ -1538,39 +1538,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
+        # NOTE: native conv1d not used for spec path — the per-position Python
+        # loop uses .item() and dynamic control flow, which is incompatible with
+        # CUDA graph capture (hipErrorStreamCaptureUnsupported). The spec path
+        # needs a HIP kernel that handles ragged batches natively. Use reference.
         if spec_sequence_masks is not None:
-            # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
-            spec_csi = spec_state_indices_tensor[
-                :, 0
-            ][  # type: ignore[index]
-                : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
-            ]
-            if _GDN_RDNA2_CONV1D_AVAILABLE:
-                mixed_qkv_spec = _rdna2_conv1d_update_spec(
-                    mixed_qkv_spec,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    spec_csi,
-                    spec_query_start_loc[
-                        : attn_metadata.num_spec_decodes
-                        + 1  # type: ignore[attr-defined]
-                    ],
-                )
-            else:
-                mixed_qkv_spec = causal_conv1d_update(
-                    mixed_qkv_spec,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=spec_csi,
-                    num_accepted_tokens=num_accepted_tokens,
-                    query_start_loc=spec_query_start_loc,
-                    max_query_len=spec_state_indices_tensor.size(-1),
-                    validate_data=False,
-                )
+            mixed_qkv_spec = causal_conv1d_update(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0][  # type: ignore[index]
+                    : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
+                ],
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices_tensor.size(-1),
+                validate_data=False,
+            )
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
