@@ -536,7 +536,7 @@ void launch_awq_gemm_q4(const half* a, const uint32_t* b_q_weight,
   if (size_m == 1) {
     // Dedicated decode GEMV: no atomic-CAS reduction, coalesced weight loads.
     // Split-K is used only when N is too small to fill the GPU on its own.
-    launch_gemv_awq_q4<256, 32>(a, b_q_weight, b_qzeros, b_scales, c, workspace,
+    launch_gemv_awq_q4<256, 64>(a, b_q_weight, b_qzeros, b_scales, c, workspace,
                                  k_splits, size_n, size_k, groups, stream);
     return;
   } else if (size_m <= 3) {
