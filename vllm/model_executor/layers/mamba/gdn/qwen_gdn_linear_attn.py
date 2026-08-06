@@ -94,9 +94,7 @@ if current_platform.is_rocm():
         if on_gfx10x():
             from vllm import _custom_ops as _gdn_ops
 
-            _GDN_RDNA2_CONV1D_AVAILABLE = hasattr(
-                _gdn_ops, "gdn_conv1d_update_rdna2"
-            )
+            _GDN_RDNA2_CONV1D_AVAILABLE = hasattr(_gdn_ops, "gdn_conv1d_update_rdna2")
             _GDN_RDNA2_SIGMOID_AVAILABLE = hasattr(
                 _gdn_ops, "gdn_sigmoid_gating_delta_rule_update_rdna2"
             )
@@ -172,6 +170,126 @@ def _rdna2_sigmoid_gating(
         final_state,
     )
     return o, final_state
+
+
+def _rdna2_conv1d_update_spec(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> torch.Tensor:
+    """Multi-token spec-decode conv1d via per-position native calls.
+
+    The native kernel handles a uniform seqlen per sequence, but spec decode
+    has variable-length ragged sequences. Process position-by-position: for
+    each token position, extract active sequences, call the native single-token
+    conv1d_update (which updates conv_state in-place). Sequential positions see
+    the updated state. Output preserves the input's ragged token ordering.
+    """
+    from vllm import _custom_ops as _gdn_ops
+
+    num_seqs = query_start_loc.shape[0] - 1
+    if num_seqs == 0:
+        return x
+
+    out = torch.empty_like(x)
+    lengths = query_start_loc[1:] - query_start_loc[:-1]
+    max_tokens = int(lengths.max().item())
+
+    for pos in range(max_tokens):
+        active = lengths > pos
+        if not active.any():
+            continue
+        active_seqs = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        token_idxs = query_start_loc[active_seqs] + pos
+        state_idxs = conv_state_indices[active_seqs]
+
+        token_x = x[token_idxs]
+        token_out = _gdn_ops.gdn_conv1d_update_rdna2(
+            token_x, weight, bias, conv_state, state_idxs
+        )
+        out[token_idxs] = token_out
+
+    return out
+
+
+def _rdna2_sigmoid_gating_spec(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Multi-token spec-decode sigmoid gating via per-position native calls."""
+
+    from vllm import _custom_ops as _gdn_ops
+
+    num_seqs = cu_seqlens.shape[0] - 1
+    if num_seqs == 0:
+        o = torch.empty(
+            (0, 1, q.shape[2], q.shape[3]),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        return o, initial_state.clone()
+
+    out = torch.empty_like(q)
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_tokens = int(lengths.max().item())
+
+    for pos in range(max_tokens):
+        active = lengths > pos
+        if not active.any():
+            continue
+        active_seqs = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        token_idxs = cu_seqlens[active_seqs] + pos
+        ssm_idxs = ssm_state_indices[active_seqs]
+
+        q_pos = q[token_idxs]
+        k_pos = k[token_idxs]
+        v_pos = v[token_idxs]
+        a_pos = a[token_idxs]
+        b_pos = b[token_idxs]
+        n_active = ssm_idxs.shape[0]
+        cu = torch.arange(n_active + 1, device=q.device, dtype=torch.int32)
+
+        K = q_pos.shape[-1]
+        B, T = n_active, 1
+        HV, V = v_pos.shape[2], v_pos.shape[3]
+        o_pos = torch.empty((B, T, HV, V), dtype=q_pos.dtype, device=q_pos.device)
+        fs = initial_state.clone()
+
+        _gdn_ops.gdn_sigmoid_gating_delta_rule_update_rdna2(
+            A_log,
+            a_pos,
+            b_pos,
+            dt_bias,
+            q_pos,
+            k_pos,
+            v_pos,
+            fs,
+            cu,
+            ssm_idxs,
+            1.0,
+            20.0,
+            K**-0.5,
+            True,
+            use_qk_l2norm_in_kernel,
+            o_pos,
+            fs,
+        )
+        out[token_idxs] = o_pos
+        initial_state[ssm_idxs] = fs[ssm_idxs]
+
+    return out, initial_state.clone()
 
 
 def _resolve_gdn_prefill_backend(
@@ -1423,20 +1541,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
-            mixed_qkv_spec = causal_conv1d_update(
-                mixed_qkv_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][  # type: ignore[index]
-                    : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
-                validate_data=False,
-            )
+            spec_csi = spec_state_indices_tensor[
+                :, 0
+            ][  # type: ignore[index]
+                : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
+            ]
+            if _GDN_RDNA2_CONV1D_AVAILABLE:
+                mixed_qkv_spec = _rdna2_conv1d_update_spec(
+                    mixed_qkv_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    spec_csi,
+                    spec_query_start_loc[
+                        : attn_metadata.num_spec_decodes
+                        + 1  # type: ignore[attr-defined]
+                    ],
+                )
+            else:
+                mixed_qkv_spec = causal_conv1d_update(
+                    mixed_qkv_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=spec_csi,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=spec_query_start_loc,
+                    max_query_len=spec_state_indices_tensor.size(-1),
+                    validate_data=False,
+                )
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -1547,8 +1681,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
+            spec_cu = spec_query_start_loc[  # type: ignore[index]
+                : attn_metadata.num_spec_decodes
+                + 1  # type: ignore[attr-defined]
+            ]
+            if _GDN_RDNA2_SIGMOID_AVAILABLE:
+                core_attn_out_spec, last_recurrent_state = _rdna2_sigmoid_gating_spec(
                     A_log=self.A_log,
                     a=a_spec,
                     b=b_spec,
@@ -1557,16 +1695,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     k=key_spec,
                     v=value_spec,
                     initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_spec_decodes
-                        + 1  # type: ignore[attr-defined]
-                    ],
+                    cu_seqlens=spec_cu,
                     ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
                 )
-            )
+            else:
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_cu,
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=num_accepted_tokens,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
@@ -1633,23 +1783,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         elif attn_metadata.num_decodes > 0:
             if _GDN_RDNA2_SIGMOID_AVAILABLE:
-                core_attn_out_non_spec, last_recurrent_state = (
-                    _rdna2_sigmoid_gating(
-                        A_log=self.A_log,
-                        a=a,
-                        b=b,
-                        dt_bias=self.dt_bias,
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        initial_state=ssm_state,
-                        cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                            : attn_metadata.num_decodes
-                            + 1  # type: ignore[attr-defined]
-                        ],
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,
-                    )
+                core_attn_out_non_spec, last_recurrent_state = _rdna2_sigmoid_gating(
+                    A_log=self.A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=self.dt_bias,
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    initial_state=ssm_state,
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes
+                        + 1  # type: ignore[attr-defined]
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
                 )
             else:
                 core_attn_out_non_spec, last_recurrent_state = (
