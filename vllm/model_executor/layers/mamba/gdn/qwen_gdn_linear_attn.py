@@ -1680,13 +1680,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
+        # NOTE: native sigmoid_gating not used for spec path — the HIP kernel
+        # has GDN_BV=16 but this model's V is ~128 (would need a kernel rewrite
+        # to tile V). Use the reference fused_sigmoid_gating_delta_rule_update.
         if spec_sequence_masks is not None:
             spec_cu = spec_query_start_loc[  # type: ignore[index]
                 : attn_metadata.num_spec_decodes
                 + 1  # type: ignore[attr-defined]
             ]
-            if _GDN_RDNA2_SIGMOID_AVAILABLE:
-                core_attn_out_spec, last_recurrent_state = _rdna2_sigmoid_gating_spec(
+            core_attn_out_spec, last_recurrent_state = (
+                fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=a_spec,
                     b=b_spec,
@@ -1695,28 +1698,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     k=key_spec,
                     v=value_spec,
                     initial_state=ssm_state,
+                    inplace_final_state=True,
                     cu_seqlens=spec_cu,
                     ssm_state_indices=spec_state_indices_tensor,
+                    num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
                 )
-            else:
-                core_attn_out_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update(
-                        A_log=self.A_log,
-                        a=a,
-                        b=b,
-                        dt_bias=self.dt_bias,
-                        q=query_spec,
-                        k=key_spec,
-                        v=value_spec,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=spec_cu,
-                        ssm_state_indices=spec_state_indices_tensor,
-                        num_accepted_tokens=num_accepted_tokens,
-                        use_qk_l2norm_in_kernel=True,
-                    )
-                )
+            )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
