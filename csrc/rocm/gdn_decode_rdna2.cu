@@ -659,7 +659,7 @@ torch::Tensor gdn_conv1d_update_spec_rdna2(
     dim3 grid(batch);
 
     if (has_bias) {
-        vllm::gdn_rdna2::conv1d_update_ragged_kernel_fp16<true>
+        conv1d_update_ragged_kernel_fp16<true>
             <<<grid, threads, 0, stream>>>(
                 (const __half*)x.data_ptr(),
                 (const __half*)weight.data_ptr(),
@@ -675,7 +675,7 @@ torch::Tensor gdn_conv1d_update_spec_rdna2(
                 (int)conv_state.stride(2),
                 (int)weight.stride(0), (int)weight.stride(1));
     } else {
-        vllm::gdn_rdna2::conv1d_update_ragged_kernel_fp16<false>
+        conv1d_update_ragged_kernel_fp16<false>
             <<<grid, threads, 0, stream>>>(
                 (const __half*)x.data_ptr(),
                 (const __half*)weight.data_ptr(),
