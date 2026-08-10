@@ -390,7 +390,7 @@ def chunked_prefill_paged_decode(
     # key_cache.stride(0), so it handles stride-padded hybrid layouts. Trust
     # it when VLLM_RDNA2_NATIVE_PAGED_ATTN is enabled.
     if not has_native_layout and current_platform.is_rocm():
-        from vllm.envs import envs as _envs
+        from vllm import envs as _envs
         from vllm.platforms.rocm import on_gfx10x
 
         if _envs.VLLM_RDNA2_NATIVE_PAGED_ATTN and on_gfx10x():
