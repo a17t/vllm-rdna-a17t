@@ -731,9 +731,8 @@ void gdn_sigmoid_gating_delta_rule_update_rdna2(
 
     int N = cu_seqlens.has_value() ? (int)cu_seqlens->size(0) - 1 : B;
     int NK = 1;
-    int NV = 1;
+    int NV = (V + GDN_BV - 1) / GDN_BV;
     TORCH_CHECK(K <= GDN_BK, "K > GDN_BK not supported");
-    TORCH_CHECK(V <= GDN_BV, "V > GDN_BV not supported");
 
     int stride_init_state_token = initial_state.stride(0);
     int stride_final_state_token = final_state.stride(0);
