@@ -764,10 +764,16 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    FP16_ACT: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
     store the result in output tensor `C`.
+
+    ``FP16_ACT`` emulates W8A16 on parts without native FP8 (gfx10x):
+    ``A`` stays fp16 (``As`` is ignored) and the fp8 ``B`` bytes are
+    decoded to fp16 bitwise in-kernel — no ``tl.float8*`` ever appears in
+    the compiled IR.
     """
 
     pid = tl.program_id(axis=0)
@@ -786,21 +792,36 @@ def _w8a8_triton_block_scaled_mm(
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    As_ptrs = As + offs_am * stride_As_m
+    if not FP16_ACT:
+        As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if FP16_ACT:
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+            # Bitwise E4M3 -> FP16 decode (B is uint8; subnormals -> 0).
+            b_sign = (b & 0x80).to(tl.uint16) << 8
+            b_exp = ((b & 0x78) >> 3).to(tl.uint16)
+            b_exp = tl.where(b_exp == 0, tl.zeros_like(b_exp), b_exp + 8)
+            b_mant = (b & 0x07).to(tl.uint16) << 7
+            b_bits = b_sign | (b_exp << 10) | b_mant
+            b = b_bits.to(tl.float16, bitcast=True)
+        else:
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        if not FP16_ACT:
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if FP16_ACT:
+            accumulator += tl.dot(a, b) * b_s[None, :]
+        else:
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -917,6 +938,20 @@ def w8a8_triton_block_scaled_mm(
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
+    from vllm.platforms.rocm import on_gfx10x
+
+    # gfx10x FP8 emulation (no native FP8, no tl.float8 in IR): keep A in
+    # fp16, decode the fp8 weight bytes bitwise inside the kernel, and
+    # apply only the per-block weight scale. As arrives as a placeholder.
+    fp16_act = current_platform.is_rocm() and on_gfx10x()
+    if fp16_act:
+        if A.dtype != torch.float16:
+            A = A.to(torch.float16)
+        logger.info_once(
+            "RDNA2: W8A16-emulated block-scaled GEMM (fp16 activations, "
+            "bitwise E4M3 weight decode) via Triton.",
+        )
+
     # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
     # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
     # so decode them to fp32 before launching the kernel.
@@ -927,8 +962,10 @@ def w8a8_triton_block_scaled_mm(
             Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
 
     assert A.shape[-1] == B.shape[-1]
-    assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    assert A.is_contiguous()
+    if not fp16_act:
+        assert A.shape[:-1] == As.shape[:-1]
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     M = A.numel() // A.shape[-1]
 
     assert B.ndim == 2 and Bs.ndim == 2
@@ -943,6 +980,27 @@ def w8a8_triton_block_scaled_mm(
     if configs:
         # Get the optimal config if there is one
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    elif fp16_act:
+        # gfx10x-tuned defaults (ported from the gfx906 fork): shallow
+        # pipelining and small M tiles improve occupancy on small dies.
+        if M <= 1:
+            bm, gm = 16, 16
+        elif M <= 8:
+            bm, gm = 16, 1
+        elif M <= 16:
+            bm, gm = 16, 8
+        elif M <= 64:
+            bm, gm = 32, 4
+        else:
+            bm, gm = 32, 8
+        config = {
+            "BLOCK_SIZE_M": bm,
+            "BLOCK_SIZE_N": block_size[0],
+            "BLOCK_SIZE_K": block_size[1],
+            "GROUP_SIZE_M": gm,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
     else:
         # Default config
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_size[0]
@@ -963,7 +1021,7 @@ def w8a8_triton_block_scaled_mm(
 
     _w8a8_triton_block_scaled_mm[grid](
         A,
-        B,
+        B.view(torch.uint8) if fp16_act else B,
         C,
         As,
         Bs,
@@ -978,11 +1036,12 @@ def w8a8_triton_block_scaled_mm(
         B.stride(0),
         C.stride(-2),
         C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
+        0 if fp16_act else As.stride(-2),
+        0 if fp16_act else As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
         **config,
+        FP16_ACT=fp16_act,
     )
 
     return C

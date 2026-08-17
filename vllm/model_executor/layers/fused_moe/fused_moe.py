@@ -352,6 +352,9 @@ def fused_moe_kernel(
     SWAP_AB: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
+    # gfx10x FP8 emulation: A stays fp16 (A_scale unused) and the fp8 B
+    # bytes are decoded to fp16 bitwise in-kernel.
+    FP16_ACT: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -486,11 +489,12 @@ def fused_moe_kernel(
     if use_fp8_w8a8 or use_int8_w8a8:
         # block-wise
         if group_k > 0 and group_n > 0:
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             offs_bsn = offs_bn // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
+            if not FP16_ACT:
+                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
         # channel-wise
         elif per_channel_quant:
             b_scale_ptrs = (
@@ -535,6 +539,14 @@ def fused_moe_kernel(
                 other=0.0,
             )
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if FP16_ACT:
+            # Bitwise E4M3 -> FP16 decode (b is uint8; subnormals -> 0).
+            b_sign = (b & 0x80).to(tl.uint16) << 8
+            b_exp = ((b & 0x78) >> 3).to(tl.uint16)
+            b_exp = tl.where(b_exp == 0, tl.zeros_like(b_exp), b_exp + 8)
+            b_mant = (b & 0x07).to(tl.uint16) << 7
+            b_bits = b_sign | (b_exp << 10) | b_mant
+            b = b_bits.to(tl.float16, bitcast=True)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -542,14 +554,24 @@ def fused_moe_kernel(
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_SIZE_K
                 offs_ks = k_start // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
-                )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-                if SWAP_AB:
-                    accumulator += tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+                if FP16_ACT:
+                    if SWAP_AB:
+                        accumulator += tl.dot(b, a) * b_scale[:, None]
+                    else:
+                        accumulator += tl.dot(a, b) * b_scale[None, :]
                 else:
-                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                    a_scale = tl.load(
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                    )
+                    if SWAP_AB:
+                        accumulator += (
+                            tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+                        )
+                    else:
+                        accumulator += (
+                            tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                        )
             else:
                 if use_fp8_w8a8:
                     # acc used to enable fp8_fast_accum
@@ -819,6 +841,16 @@ def invoke_fused_moe_triton_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    # gfx10x FP8 emulation: A stays fp16 (A_scale is None) and the fp8
+    # weight bytes are decoded in-kernel; view B as uint8 for the kernel.
+    fp16_act = use_fp8_w8a8 and block_shape is not None
+    if fp16_act and current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx10x
+
+        fp16_act = on_gfx10x()
+    if fp16_act:
+        B = B.view(torch.uint8)
+
     M = A.size(0)
     num_tokens = M * top_k
     if sorted_token_ids is not None:
@@ -900,6 +932,7 @@ def invoke_fused_moe_triton_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
         USE_TD=use_td,
+        FP16_ACT=fp16_act,
         **config,
     )
 
@@ -1093,6 +1126,11 @@ def get_config_file_name(
     # Set device_name to H200 if a device from the H200 family is detected
     if "H200" in device_name.split("_"):
         device_name = "NVIDIA_H200"
+    # Normalize RDNA2 parts (V620 / 6800-6950 XT class) so one tuned-config
+    # family covers them (ported from the gfx906 fork's AMD_GFX906 mapping).
+    gfx1030_names = ["Radeon_Pro_V620", "Radeon_RX_6950", "Radeon_RX_6900", "gfx1030"]
+    if any(s in device_name for s in gfx1030_names):
+        device_name = "AMD_GFX1030"
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"

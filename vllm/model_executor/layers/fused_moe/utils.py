@@ -387,8 +387,15 @@ def moe_kernel_quantize_input(
     if quant_dtype == current_platform.fp8_dtype():
         if quantization_emulation:
             return _fp8_quantize_dequantize(A, A_scale)
-        else:
-            return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx10x
+
+            if on_gfx10x():
+                # No native FP8 on gfx10x and Triton cannot compile
+                # tl.float8 stores there: keep activations in fp16; the
+                # fused kernel decodes the fp8 weights bitwise (FP16_ACT).
+                return (A.to(torch.float16) if A.dtype != torch.float16 else A), None
+        return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == torch.int8:
         if quantization_emulation:
             raise NotImplementedError(

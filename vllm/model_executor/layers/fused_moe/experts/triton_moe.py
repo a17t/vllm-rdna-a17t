@@ -455,12 +455,20 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # Fuse SiLU+Mul + FP8 block quantize into a single kernel
         # when conditions permit (gated SiLU, fp8 block quant with
         # group_size=128, no LoRA requiring the BF16 intermediate).
+        # Skipped on gfx10x: the fused op writes FP8 which the Triton
+        # MoE path cannot consume there (fp16-activation emulation).
+        _rdna2_fp8_emu = False
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx10x
+
+            _rdna2_fp8_emu = on_gfx10x() and self.quant_config.use_fp8_w8a8
         if (
             activation == MoEActivation.SILU
             and self.quant_config.use_fp8_w8a8
             and self.block_shape == [128, 128]
             and lora_context is None
             and not is_deep_gemm_e8m0_used()
+            and not _rdna2_fp8_emu
         ):
             qintermediate_cache2, a2q_scale = ops.silu_and_mul_per_block_quant(
                 intermediate_cache1.view(-1, N),

@@ -180,6 +180,25 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         )
 
 
+class RDNA2Fp16ActFp8BlockScaledMMKernel(TritonFp8BlockScaledMMKernel):
+    """gfx10x FP8 emulation: activations stay fp16 (skip the per-token-group
+    FP8 quant, which cannot be compiled on RDNA2 Triton) and the fp8 weight
+    bytes are decoded in-kernel. Must be listed ahead of the plain Triton
+    kernel on ROCm for gfx10x parts."""
+
+    apply_input_quant = False
+
+    @classmethod
+    def is_supported(cls, compute_capability=None):
+        if not current_platform.is_rocm():
+            return False, "only ROCm gfx10x devices are supported."
+        from vllm.platforms.rocm import on_gfx10x
+
+        if not on_gfx10x():
+            return False, "only ROCm gfx10x devices are supported."
+        return True, None
+
+
 # TODO we should be able to change the type of block_size to GroupShape
 # after we resolve GroupShape compilation issue
 # https://github.com/vllm-project/vllm/issues/25270
