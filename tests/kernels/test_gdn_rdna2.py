@@ -304,7 +304,7 @@ def _run_sigmoid_triton(
     use_qk_l2norm=True,
 ):
     """Run Triton sigmoid gating reference."""
-    from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
+    from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
