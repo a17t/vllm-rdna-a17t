@@ -69,6 +69,10 @@ class RocmAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
 
+    # CPU-side lengths for the experimental Torch SDPA prefill path.
+    query_start_loc_cpu: torch.Tensor | None = None
+    seq_lens_cpu: torch.Tensor | None = None
+
     # DFlash drafting sets this to False via CommonAttentionMetadata.
     causal: bool = True
 
@@ -157,6 +161,8 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
             causal=common_attn_metadata.causal,
         )
         return attn_metadata
@@ -464,6 +470,9 @@ class RocmAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             sinks=self.sinks,
             causal=attn_metadata.causal,
+            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=attn_metadata.seq_lens_cpu,
+            attn_type=self.attn_type,
         )
 
         return output

@@ -1008,3 +1008,100 @@ def test_qwen3_nonstandard_block_size(
         device=device,
         op=op,
     )
+
+
+@pytest.mark.parametrize("sdpa_prefill_env", [False, True])
+@torch.inference_mode()
+def test_chunked_prefill_cudagraph_capture_multi_token(
+    monkeypatch, sdpa_prefill_env: bool
+) -> None:
+    """Regression guard: MTP decode capture (max_query_len > 1) must not
+    materialize CPU lengths during CUDA graph capture.
+
+    The gfx10x Torch-SDPA prefill hook needs CPU q/seq lengths; before the
+    gate-order fix it ran ``seq_lens.cpu()`` inside the capture (a non-pinned
+    D2H copy -> RuntimeError) whenever spec-decode capture entered the
+    ``max_query_len > 1`` branch, even with VLLM_TORCH_SDPA_PREFILL=0.
+    """
+    from vllm.platforms.rocm import on_gfx10x
+
+    if not (current_platform.is_rocm() and on_gfx10x()):
+        pytest.skip("Requires RDNA2 (gfx1030)")
+
+    if sdpa_prefill_env:
+        monkeypatch.setenv("VLLM_TORCH_SDPA_PREFILL", "1")
+    else:
+        monkeypatch.delenv("VLLM_TORCH_SDPA_PREFILL", raising=False)
+
+    set_random_seed(0)
+    torch.set_default_device("cuda")
+
+    num_heads, num_kv_heads, head_size = 32, 4, 128
+    block_size, bs, query_len, ctx_len = 16, 2, 3, 128
+    seq_len = ctx_len + query_len
+    dtype = torch.float16
+
+    query = torch.randn(bs * query_len, num_heads, head_size, dtype=dtype) * 1e-3
+    output = torch.empty_like(query)
+    k = torch.randn(bs * query_len, num_kv_heads, head_size, dtype=dtype) * 1e-3
+    v = torch.randn_like(k) * 1e-3
+
+    max_blocks_per_seq = (seq_len + block_size - 1) // block_size
+    cache_size = bs * max_blocks_per_seq
+    k_cache_base = (
+        torch.randn(cache_size, block_size, num_kv_heads, head_size, dtype=dtype)
+        * 1e-3
+    )
+    # ROCM_ATTN K layout: (blocks, kv_heads, head_size//8, block_size, 8)
+    k_cache = (
+        k_cache_base.view(-1, block_size, num_kv_heads, head_size // 8, 8)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    # ROCM_ATTN V layout: (blocks, kv_heads, head_size, block_size)
+    v_cache = k_cache_base.permute(0, 2, 3, 1).contiguous()
+    block_table = torch.arange(cache_size, dtype=torch.int32).view(
+        bs, max_blocks_per_seq
+    )
+    query_start_loc = torch.arange(
+        0, bs + 1, dtype=torch.int32, device="cuda"
+    ).mul_(query_len)
+    seq_lens = torch.full((bs,), seq_len, dtype=torch.int32, device="cuda")
+    k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+
+    # Pre-materialize the CPU lengths (as rocm_attn's metadata does);
+    # seq_lens_cpu stays None so the op would have to derive it — the
+    # pre-fix crash path during capture.
+    query_start_loc_cpu = query_start_loc.cpu()
+
+    def run() -> None:
+        chunked_prefill_paged_decode(
+            query,
+            k,
+            v,
+            output,
+            "auto",
+            k_cache,
+            v_cache,
+            block_table,
+            query_start_loc,
+            seq_lens,
+            ctx_len,
+            query_len,
+            k_scale,
+            v_scale,
+            sliding_window=0,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens_cpu=None,
+        )
+
+    # Eager warmup: compiles context_attention_fwd outside capture.
+    run()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output.isfinite().all()

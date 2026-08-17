@@ -144,6 +144,29 @@ if TYPE_CHECKING:
     # RDNA2: use the native paged-attention kernel for full_attention layers.
     # Set to 0 to use the reference attention backend.
     VLLM_RDNA2_NATIVE_PAGED_ATTN: bool = True
+    # RDNA2: tuned Triton attention launch parameters (num_warps=4,
+    # num_stages=1, prefill tile 16) ported from the gfx906 fork.
+    # Set to 0 to use Triton defaults.
+    VLLM_RDNA2_TRITON_ATTN_TUNING: bool = True
+    # Number of parallel softmax segments used by the 3D split-softmax
+    # decode path of the Triton attention backend. Higher values improve
+    # decode / spec-decode ITL on small GPUs at the cost of the segment
+    # buffers (16 is conservative; 64 measured best for Qwen3.6-27B MTP
+    # on gfx906).
+    VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS: int = 16
+    # Experimental Torch SDPA attention fallback paths (ported from the
+    # gfx906 fork): gather paged KV per sequence and run
+    # F.scaled_dot_product_attention instead of the Triton paged kernels.
+    # Off by default; rocBLAS/torch SDPA can beat Triton prefill/decode on
+    # small-die parts. Applies to both TRITON_ATTN and ROCM_ATTN backends.
+    VLLM_TORCH_SDPA_PREFILL: bool = False
+    VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS: int = 0
+    VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS: int = 0
+    VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE: int = 0
+    VLLM_TORCH_SDPA_BACKEND: str = "math"  # auto, math, flash
+    VLLM_TORCH_SDPA_DECODE: bool = False
+    VLLM_TORCH_SDPA_DECODE_MAX_SEQS: int = 1
+    VLLM_TORCH_SDPA_MTP_DECODE: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1240,6 +1263,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_RDNA2_NATIVE_PAGED_ATTN": lambda: bool(
         int(os.getenv("VLLM_RDNA2_NATIVE_PAGED_ATTN", "1"))
+    ),
+    "VLLM_RDNA2_TRITON_ATTN_TUNING": lambda: bool(
+        int(os.getenv("VLLM_RDNA2_TRITON_ATTN_TUNING", "1"))
+    ),
+    "VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS": lambda: int(
+        os.getenv("VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS", "16")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL", "False").lower() in ("true", "1")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_MIN_TOKENS", "0")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_MAX_TOKENS", "0")
+    ),
+    "VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_PREFILL_Q_CHUNK_SIZE", "0")
+    ),
+    "VLLM_TORCH_SDPA_BACKEND": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_BACKEND", "math").lower()
+    ),
+    "VLLM_TORCH_SDPA_DECODE": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_DECODE", "False").lower() in ("true", "1")
+    ),
+    "VLLM_TORCH_SDPA_DECODE_MAX_SEQS": lambda: int(
+        os.environ.get("VLLM_TORCH_SDPA_DECODE_MAX_SEQS", "1")
+    ),
+    "VLLM_TORCH_SDPA_MTP_DECODE": lambda: (
+        os.environ.get("VLLM_TORCH_SDPA_MTP_DECODE", "False").lower()
+        in ("true", "1")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

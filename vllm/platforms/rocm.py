@@ -156,6 +156,26 @@ def _sync_hip_cuda_env_vars():
 _sync_hip_cuda_env_vars()
 
 
+def _set_rocm_nccl_workarounds():
+    """Disable NCCL watchdog/monitoring threads on ROCm to prevent
+    hipErrorCapturedEvent during CUDA graph capture with tensor parallelism.
+
+    The PyTorch NCCL watchdog thread queries HIP events via hipEventQuery,
+    which throws hipErrorCapturedEvent when events belong to a capturing
+    stream. TORCH_NCCL_BLOCKING_WAIT=1 is the only way to prevent the
+    watchdog from starting (TORCH_NCCL_ASYNC_ERROR_HANDLING=0 only changes
+    the error handling mode but does NOT stop the watchdog).
+    (Ported from the gfx906 fork, found during AWQ MTP+TP2 testing.)
+    """
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+    os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+
+
+_set_rocm_nccl_workarounds()
+
+
 # AMDSMI utils
 # Note that NVML is not affected by `{CUDA/HIP}_VISIBLE_DEVICES`,
 # all the related functions work on real physical device ids.
@@ -998,7 +1018,10 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_cdna() or on_rdna4()
+        # gfx10x has no native FP8; the Triton block-scaled kernel emulates
+        # W8A16 (fp16 activations + bitwise E4M3 weight decode in-kernel),
+        # ported from the gfx906 fork. Experimental on RDNA2.
+        return on_cdna() or on_rdna4() or on_gfx10x()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:

@@ -9,10 +9,14 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx10x
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
 from .prefix_prefill import context_attention_fwd
 
@@ -305,6 +309,9 @@ def chunked_prefill_paged_decode(
     sinks=None,
     is_block_table_ptr: bool = False,
     causal: bool = True,
+    query_start_loc_cpu: torch.Tensor | None = None,
+    seq_lens_cpu: torch.Tensor | None = None,
+    attn_type: AttentionType = AttentionType.DECODER,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
@@ -315,29 +322,95 @@ def chunked_prefill_paged_decode(
         sliding_window = 0
 
     if max_query_len > 1:
-        context_attention_fwd(
-            q=query,
-            k=key,
-            v=value,
-            o=output,
-            kv_cache_dtype=kv_cache_dtype,
-            k_cache=key_cache,
-            v_cache=value_cache,
-            b_loc=block_table,
-            b_start_loc=query_start_loc,
-            b_seq_len=seq_lens,
-            max_seq_len=max_seq_len,
-            max_input_len=max_query_len,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            alibi_slopes=alibi_slopes,
-            sliding_window=sliding_window,
-            sm_scale=sm_scale,
-            skip_decode=True,
-            fp8_out_scale=output_scale,
-            sinks=sinks,
-            causal=causal,
-        )
+        prefill_handled = False
+        # Cheap gates first: the SDPA path needs CPU lengths, which must
+        # never be materialized (GPU->CPU copy) during CUDA graph capture
+        # — with spec decode, capture runs with max_query_len > 1 too.
+        if (
+            on_gfx10x()
+            and envs.VLLM_TORCH_SDPA_PREFILL
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from vllm.v1.attention.ops.torch_attention import (
+                can_use_torch_sdpa_prefill,
+                torch_sdpa_prefill_attention,
+            )
+
+            kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+
+            if query_start_loc_cpu is not None:
+                q_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            else:
+                q_lens_cpu = (query_start_loc[1:] - query_start_loc[:-1]).cpu()
+
+            if seq_lens_cpu is None:
+                if max_seq_len == max_query_len:
+                    seq_lens_cpu = q_lens_cpu
+                else:
+                    seq_lens_cpu = seq_lens.cpu()
+
+            if can_use_torch_sdpa_prefill(
+                num_actual_tokens=query.shape[0],
+                max_query_len=max_query_len,
+                query_lens_cpu=q_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+                attn_type=attn_type,
+                kv_quant_mode=kv_quant_mode,
+                q_dtype=query.dtype,
+                k_dtype=key_cache.dtype,
+                v_dtype=value_cache.dtype,
+                alibi_slopes=alibi_slopes,
+                use_alibi_sqrt=False,
+                sinks=sinks,
+                logits_soft_cap=0,
+                sliding_window=(sliding_window - 1, 0)
+                if sliding_window > 0
+                else (-1, -1),
+                chunk_lookback=-1,
+                output_scale=output_scale,
+                mm_prefix_range_tensor=None,
+            ):
+                if query_start_loc_cpu is None:
+                    query_start_loc_cpu = query_start_loc.cpu()
+
+                torch_sdpa_prefill_attention(
+                    q=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=block_table,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    seq_lens_cpu=seq_lens_cpu,
+                    num_kv_heads=key_cache.shape[1],
+                    num_queries_per_kv=query.shape[1] // key_cache.shape[1],
+                    scale=sm_scale,
+                    output=output,
+                )
+                prefill_handled = True
+
+        if not prefill_handled:
+            context_attention_fwd(
+                q=query,
+                k=key,
+                v=value,
+                o=output,
+                kv_cache_dtype=kv_cache_dtype,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                b_loc=block_table,
+                b_start_loc=query_start_loc,
+                b_seq_len=seq_lens,
+                max_seq_len=max_seq_len,
+                max_input_len=max_query_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                alibi_slopes=alibi_slopes,
+                sliding_window=sliding_window,
+                sm_scale=sm_scale,
+                skip_decode=True,
+                fp8_out_scale=output_scale,
+                sinks=sinks,
+                causal=causal,
+            )
 
     block_size = value_cache.shape[3]
     num_seqs = len(seq_lens)
@@ -366,7 +439,12 @@ def chunked_prefill_paged_decode(
         key_cache = key_cache.view(target_dtype)
         value_cache = value_cache.view(target_dtype)
 
-    num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
+    # Padding the GQA group to 16 rows inflates register / LDS usage on
+    # small-die parts; the kernel only needs a power of two.
+    if on_gfx10x():
+        num_queries_per_kv_padded = triton.next_power_of_2(num_queries_per_kv)
+    else:
+        num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
 
     from vllm.platforms.rocm import use_rocm_custom_paged_attention
 
@@ -389,12 +467,13 @@ def chunked_prefill_paged_decode(
     # RDNA2: the custom paged-attention kernel extracts kv_block_stride from
     # key_cache.stride(0), so it handles stride-padded hybrid layouts. Trust
     # it when VLLM_RDNA2_NATIVE_PAGED_ATTN is enabled.
-    if not has_native_layout and current_platform.is_rocm():
-        from vllm import envs as _envs
-        from vllm.platforms.rocm import on_gfx10x
-
-        if _envs.VLLM_RDNA2_NATIVE_PAGED_ATTN and on_gfx10x():
-            has_native_layout = True
+    if (
+        not has_native_layout
+        and current_platform.is_rocm()
+        and envs.VLLM_RDNA2_NATIVE_PAGED_ATTN
+        and on_gfx10x()
+    ):
+        has_native_layout = True
     if not is_pow2 or not has_native_layout:
         use_custom = False
 
@@ -443,6 +522,12 @@ def chunked_prefill_paged_decode(
             "Cannot use ROCm custom paged attention kernel,"
             " falling back to Triton implementation."
         )
+        triton_launch_kwargs: dict[str, int] = {}
+        if on_gfx10x():
+            # gfx10x is sensitive to Triton default launch choices here.
+            # Match the conservative decode settings of the unified
+            # attention path to keep register/LDS pressure low.
+            triton_launch_kwargs = {"num_warps": 4, "num_stages": 1}
         real_block_size = value_cache.shape[3]
         # The standard model directly uses the original block_size.
         # Non-standard 544 uses 32 to accommodate integer division logic.
@@ -513,4 +598,5 @@ def chunked_prefill_paged_decode(
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
             USE_FP8=output_scale is not None,
+            **triton_launch_kwargs,
         )
