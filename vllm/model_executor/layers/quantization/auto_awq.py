@@ -359,7 +359,7 @@ class AutoAWQConfig(QuantizationConfig):
             if current_platform.is_rocm():
                 from vllm.platforms.rocm import on_gfx10x
 
-                if on_gfx10x():
+                if on_gfx10x() and envs.VLLM_RDNA2_NATIVE_AWQ:
                     from .awq_moe_rdna2 import (
                         AWQMoERDNA2Method,
                         _is_rdna2_awq_supported,

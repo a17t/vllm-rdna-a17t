@@ -58,3 +58,94 @@ def test_rdna2_gemv_smoke():
     out = rdna2_gemv(x, w, None)
     assert out.shape == (64,)
     assert out.isfinite().all()
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx10x()),
+    reason="Requires RDNA2 (gfx1030)",
+)
+@pytest.mark.parametrize("M", [2, 3, 5, 8, 16])
+@pytest.mark.parametrize("N,K", [(512, 1024), (1536, 2048), (4096, 2176)])
+def test_rdna2_skinny_matmul_vs_linear(M, N, K):
+    """Small-M matmul (spec-decode verify / MTP batches) vs F.linear."""
+    from vllm.model_executor.layers.rdna2_gemm import rdna2_skinny_matmul
+
+    torch.manual_seed(0)
+    a = torch.randn(M, K, dtype=torch.float16, device=DEVICE)
+    b = torch.randn(N, K, dtype=torch.float16, device=DEVICE) * 0.1
+
+    ref = torch.nn.functional.linear(a, b)
+    out = rdna2_skinny_matmul(a, b)
+
+    assert out.shape == ref.shape
+    assert out.isfinite().all(), "skinny matmul produced inf/nan"
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    assert max_diff < 1.0, f"M={M} N={N} K={K}: max_diff={max_diff}"
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx10x()),
+    reason="Requires RDNA2 (gfx1030)",
+)
+def test_rdna2_skinny_matmul_matches_gemv():
+    """Per-row consistency between the M=1 GEMV and the tl.dot matmul."""
+    from vllm.model_executor.layers.rdna2_gemm import rdna2_skinny_matmul
+
+    torch.manual_seed(0)
+    N, K, M = 1024, 2048, 4
+    a = torch.randn(M, K, dtype=torch.float16, device=DEVICE)
+    b = torch.randn(N, K, dtype=torch.float16, device=DEVICE) * 0.1
+    out = rdna2_skinny_matmul(a, b)
+    ref = torch.stack([rdna2_gemv(a[i], b, None) for i in range(M)])
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    assert max_diff < 1.0, f"max_diff={max_diff}"
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx10x()),
+    reason="Requires RDNA2 (gfx1030)",
+)
+@pytest.mark.parametrize(
+    "N,K,gs",
+    [(8704, 5120, 32), (5120, 8704, 32), (4096, 5120, 32),
+     (5120, 4096, 32), (1024, 2048, 64), (512, 1024, 128)],
+)
+@pytest.mark.parametrize("has_zp", [True, False])
+def test_rdna2_w4a16_gemv(N, K, gs, has_zp):
+    """M=1 W4A16 GEMV vs dequant reference (fp32 math)."""
+    from vllm.model_executor.layers.rdna2_gemm import rdna2_w4a16_gemv
+
+    def pack_along_last(t):
+        R, C = t.shape
+        out = torch.zeros(R, C // 8, dtype=torch.int32, device=t.device)
+        for i in range(8):
+            out |= t[:, i::8].to(torch.int32) << (4 * i)
+        return out.contiguous()
+
+    torch.manual_seed(0)
+    w4 = torch.randint(0, 16, (N, K), dtype=torch.int32, device=DEVICE)
+    qweight = pack_along_last(w4.t().contiguous())  # (K, N//8)
+    scales = torch.rand(K // gs, N, dtype=torch.float16, device=DEVICE) * 0.01 + 0.005
+    zp_bias = 8
+    if has_zp:
+        zeros_v = torch.randint(
+            0, 16, (K // gs, N), dtype=torch.int32, device=DEVICE
+        )
+        qzeros = pack_along_last(zeros_v)  # (K//gs, N//8)
+        zero_ref = zeros_v
+    else:
+        qzeros = None
+        zero_ref = torch.full(
+            (K // gs, N), zp_bias, dtype=torch.int32, device=DEVICE
+        )
+
+    x = torch.randn(K, dtype=torch.float16, device=DEVICE) * 0.1
+    out = rdna2_w4a16_gemv(x, qweight, scales, qzeros, gs, zp_bias)
+
+    # dequant: w[n, k] = (w4[n, k] - zero[k // gs, n]) * scale[k // gs, n]
+    z_nk = zero_ref.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    s_nk = scales.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    w_deq = (w4.to(torch.float32) - z_nk) * s_nk
+    ref = x.float() @ w_deq.T
+    torch.testing.assert_close(out.float(), ref, atol=2e-1, rtol=2e-2)
+    assert out.isfinite().all()

@@ -209,7 +209,7 @@ def triton_w4a16_gemm(
     zeros_ptr = qzeros if has_zp else b_q
 
     if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx10x, on_gfx1x
+        from vllm.platforms.rocm import on_gfx1x, on_gfx10x
 
         if on_gfx1x() or on_gfx10x():
             # Tuned for RDNA GPUs (32-wide wavefronts).

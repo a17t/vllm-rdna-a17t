@@ -137,6 +137,25 @@ def rocm_unquantized_gemm_impl(
         out = rdna2_gemv(x.reshape(-1), weight, bias)
         return out.reshape(*x.shape[:-1], weight.shape[0])
 
+    # RDNA2: small-M (spec-decode verify / MTP draft) projections. Same
+    # rationale as the M=1 GEMV above — the HIP skinny kernels are not
+    # gfx10-safe, so route 1 < n <= 16 through the Triton skinny matmul
+    # (ported from the gfx906 fork) instead of F.linear.
+    if (
+        on_gfx10x()
+        and 1 < n <= 16
+        and bias is None
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and weight.is_contiguous()
+    ):
+        from vllm.model_executor.layers.rdna2_gemm import rdna2_skinny_matmul
+
+        x_view = x.reshape(-1, x.size(-1))
+        out = rdna2_skinny_matmul(
+            x_view if x_view.is_contiguous() else x_view.contiguous(), weight
+        )
+        return out.reshape(*x.shape[:-1], weight.shape[0])
+
     cu_count = num_compute_units()
 
     # Next ^2 of n

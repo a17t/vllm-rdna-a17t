@@ -945,6 +945,21 @@ class CompilationConfig:
             ):
                 self.inductor_compile_config.setdefault(key, enable_asserts)
 
+        if current_platform.is_rocm() and _is_rocm_gfx10x():
+            # RDNA2: run the parallel-linear layers as opaque custom ops
+            # so their quant apply (incl. the M=1 W4A16 GEMV dispatch) is
+            # evaluated with the real runtime shapes at CUDA-graph capture
+            # instead of being traced/baked out of the compiled graph
+            # (dynamic-shape guards are not re-evaluated at runtime).
+            for op in (
+                "+column_parallel_linear",
+                "+row_parallel_linear",
+                "+replicated_linear",
+            ):
+                if op not in self.custom_ops and f"-{op[1:]}" not in self.custom_ops:
+                    self.custom_ops.append(op)
+
+
         for k, v in self.inductor_passes.items():
             if not isinstance(v, str):
                 assert callable(v), f"pass {k} should be callable or a qualified name"

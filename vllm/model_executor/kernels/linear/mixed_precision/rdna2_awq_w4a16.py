@@ -33,6 +33,8 @@ class RDNA2AWQLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        import vllm.envs as envs
+
         if not current_platform.is_rocm():
             return False, "RDNA2 AWQ kernel is ROCm-only"
 
@@ -40,6 +42,12 @@ class RDNA2AWQLinearKernel(MPLinearKernel):
 
         if not on_gfx10x():
             return False, "RDNA2 AWQ kernel requires gfx1030"
+
+        if not envs.VLLM_RDNA2_NATIVE_AWQ:
+            return (
+                False,
+                "VLLM_RDNA2_NATIVE_AWQ=0: no speed benefit over Triton path",
+            )
 
         if not (
             hasattr(torch.ops, "_rocm_C")
@@ -76,12 +84,21 @@ class RDNA2AWQLinearKernel(MPLinearKernel):
             )
 
         gs = c.group_size
-        if gs not in [-1, 32, 64, 128, 256] and gs != c.full_weight_shape[0]:
+        if gs in (32,):
+            # Measured on gfx1030: at group_size=32 the kernel runs at
+            # 11-24 GB/s effective (~5x slower than the Triton W4A16 path)
+            # because scale/zero traffic dominates. Let the Triton kernel
+            # (with the M=1 GEMV fast path) serve these layers.
+            return (
+                False,
+                "group_size=32: scale-traffic bound; use the Triton path",
+            )
+        if gs not in [-1, 64, 128, 256] and gs != c.full_weight_shape[0]:
             return (
                 False,
                 (
                     f"Group size {gs} not supported; "
-                    "supported: [-1, 32, 64, 128, 256] "
+                    "supported: [-1, 64, 128, 256] "
                     f"or full K ({c.full_weight_shape[0]})"
                 ),
             )

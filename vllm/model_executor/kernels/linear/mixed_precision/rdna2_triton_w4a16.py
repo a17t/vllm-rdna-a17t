@@ -19,9 +19,62 @@ from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 from .triton_w4a16 import triton_w4a16_gemm
+
+
+def _rdna2_w4a16_linear_impl(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_zp: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    group_size: int,
+    zp_bias: int,
+) -> torch.Tensor:
+    """Eager dispatch: M=1 decode GEMV vs the generic tl.dot GEMM.
+
+    Wrapped as an opaque custom op so torch.compile/CUDA-graph capture
+    executes this with the real runtime M (dynamic-shape guards are not
+    re-evaluated at runtime, so a Python ``if M == 1`` at the call site
+    would be baked out of the traced graph).
+    """
+    if (
+        x.shape[0] == 1
+        and x.shape[1] % 32 == 0
+        and group_size in (32, 64, 128, 256)
+    ):
+        from vllm.model_executor.layers.rdna2_gemm import rdna2_w4a16_gemv
+
+        return rdna2_w4a16_gemv(
+            x, w_q, w_s, w_zp, group_size, zp_bias, bias
+        ).unsqueeze(0)
+
+    out = triton_w4a16_gemm(x, w_q, w_s, w_zp, group_size, zp_bias)
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+def _rdna2_w4a16_linear_fake(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_zp: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    group_size: int,
+    zp_bias: int,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], w_q.shape[1] * 8))
+
+
+direct_register_custom_op(
+    op_name="rdna2_w4a16_linear",
+    op_func=_rdna2_w4a16_linear_impl,
+    fake_impl=_rdna2_w4a16_linear_fake,
+)
 
 
 class RDNA2TritonW4A16LinearKernel(MPLinearKernel):
@@ -139,16 +192,9 @@ class RDNA2TritonW4A16LinearKernel(MPLinearKernel):
 
         zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
 
-        output = triton_w4a16_gemm(
-            a=x_2d,
-            b_q=w_q,
-            scales=w_s,
-            qzeros=w_zp,
-            group_size=group_size,
-            zp_bias=zp_bias,
+        # Opaque custom op: the M=1 GEMV dispatch must see the real
+        # runtime M at capture, not a traced symbolic shape.
+        output = torch.ops.vllm.rdna2_w4a16_linear(
+            x_2d, w_q, w_s, w_zp, bias, group_size, zp_bias
         )
-
-        if bias is not None:
-            output.add_(bias)
-
         return output.reshape(out_shape)
