@@ -347,7 +347,15 @@ def kernel_unified_attention(
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
-    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+    # Rows beyond BLOCK_Q * num_queries_per_kv are padding when BLOCK_M is
+    # rounded up to a power of two (e.g. qpk=7 -> BLOCK_M=16, BLOCK_Q=2).
+    # Without the row bound those lanes resolve to real (or stale) query
+    # rows of the *next* q-block and corrupt the output / 3D segment
+    # partials — this silently degrades spec-decode acceptance.
+    query_head_mask = offs_m < BLOCK_Q * num_queries_per_kv
+    query_mask_1 = (
+        (query_offset_1 < num_query_heads) & query_head_mask
+    ).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     if USE_TD_QO:
@@ -938,6 +946,18 @@ def unified_attention(
     launch_num_warps: int | None = None
     launch_num_stages: int | None = None
 
+    # RDNA2 (gfx10x) tuning, ported from the gfx906 fork: shallow
+    # pipelining (num_stages=1) keeps LDS pressure low and 4 warps is the
+    # sweet spot on the 4-SIMD wave32 geometry.
+    rdna2_attn_tuning = False
+    if envs.VLLM_RDNA2_TRITON_ATTN_TUNING and current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx10x
+
+        rdna2_attn_tuning = on_gfx10x()
+    if rdna2_attn_tuning and launch_num_warps is None:
+        launch_num_warps = 4
+        launch_num_stages = 1
+
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
@@ -981,6 +1001,11 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+
+    # gfx906 measurements showed tile 16 beats 32 for prefill on small
+    # wave64/wave32 parts; apply the same on gfx10x under the tuning flag.
+    if rdna2_attn_tuning:
+        TILE_SIZE_PREFILL = min(TILE_SIZE_PREFILL, 16)
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
@@ -1035,16 +1060,29 @@ def unified_attention(
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
-    # 2. The batch includes at least one prefill request, or
-    # 3. The number of sequences exceeds the configured threshold, or
-    # 4. Batch invariance is enabled
+    # 2. The batch includes at least one prefill-sized request (query len
+    #    above what the 3D segment buffers were sized for), or
+    # 3. The padded query token count exceeds the 3D buffer capacity, or
+    # 4. The number of sequences exceeds the configured threshold, or
+    # 5. Batch invariance is enabled
+    # The segment buffers are sized for ``max_decode_query_len``-token
+    # queries (spec-decode verify / MTP drafts), so multi-token queries up
+    # to that bound still take the 3D split-softmax path.
+    max_seqlen_q_3d = (
+        softmax_segm_output.shape[0] // seq_threshold_3D
+        if seq_threshold_3D is not None
+        and seq_threshold_3D > 0
+        and softmax_segm_output is not None
+        else 1
+    )
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or max_seqlen_q > max_seqlen_q_3d
+        or q.shape[0] > softmax_segm_output.shape[0]
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
@@ -1086,6 +1124,19 @@ def unified_attention(
         launch_kwargs["num_warps"] = launch_num_warps
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
+
+    if rdna2_attn_tuning or use_3d:
+        logger.info_once(
+            "unified_attention route: %s (max_query_len=%d, q_tokens=%d, "
+            "num_seqs=%d, max_query_len_3d=%d, warps=%s, stages=%s)",
+            "3d" if use_3d else "2d",
+            max_seqlen_q,
+            q.shape[0],
+            num_seqs,
+            max_seqlen_q_3d,
+            launch_num_warps,
+            launch_num_stages,
+        )
 
     kernel_unified_attention[grid](
         output_ptr=out,
@@ -1186,4 +1237,5 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            **launch_kwargs,
         )

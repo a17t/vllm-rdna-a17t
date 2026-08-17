@@ -643,3 +643,193 @@ def test_triton_unified_attn_use_td_tile_clamp(
         soft_cap=None,
         seq_threshold_3D=0,
     )
+
+
+@pytest.mark.parametrize(
+    "query_len,seq_threshold_3D", [(130, 1), (64, 0), (33, 2)]
+)
+@torch.inference_mode()
+def test_triton_unified_attn_gqa_padding_rows(
+    query_len: int, seq_threshold_3D: int
+) -> None:
+    """Regression guard for the query_mask_1 padding-row fix.
+
+    With num_heads=(28, 4) -> num_queries_per_kv=7, BLOCK_M=16 and
+    BLOCK_Q=2: rows 14..15 of each q-block are padding. Pre-fix,
+    ``query_mask_1`` let those lanes load the *next* q-block's rows,
+    corrupting every token (observed max_err ~1.4 on gfx1030).
+    """
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+
+    num_heads = (28, 4)
+    head_size, block_size, num_blocks = 128, 16, 64
+    seq_lens = [(query_len, query_len), (query_len, query_len)]
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
+    max_num_blocks_per_seq = (max(kv_lens_list) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    num_par_softmax_segments = 16
+    head_size_padded = next_power_of_2(head_size)
+    softmax_segm_output = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments, head_size_padded),
+        dtype=torch.float32,
+    )
+    softmax_segm_max = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+    softmax_segm_expsum = torch.empty(
+        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+
+    output = torch.empty_like(query)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=seq_threshold_3D,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
+@torch.inference_mode()
+def test_triton_unified_attn_mtp_multitoken_3d(
+    num_speculative_tokens: int,
+) -> None:
+    """Multi-token decode queries (spec-decode verify / MTP) take the 3D
+    split-softmax path when the segment buffers are sized for
+    ``max_decode_query_len`` tokens per sequence (gfx906-fork port)."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+
+    num_heads = (32, 4)
+    head_size, block_size, num_blocks = 128, 16, 128
+    query_len = 1 + num_speculative_tokens
+    kv_len = 512
+    seq_lens = [(query_len, kv_len), (query_len, kv_len)]
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens = torch.tensor([x[1] for x in seq_lens], dtype=torch.int32)
+    max_num_blocks_per_seq = (kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    seq_threshold_3D = 4
+    num_par_softmax_segments = 16
+    head_size_padded = next_power_of_2(head_size)
+    max_3d_query_tokens = seq_threshold_3D * query_len
+    softmax_segm_output = torch.empty(
+        (
+            max_3d_query_tokens,
+            num_query_heads,
+            num_par_softmax_segments,
+            head_size_padded,
+        ),
+        dtype=torch.float32,
+    )
+    softmax_segm_max = torch.empty(
+        (max_3d_query_tokens, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+    softmax_segm_expsum = torch.empty(
+        (max_3d_query_tokens, num_query_heads, num_par_softmax_segments),
+        dtype=torch.float32,
+    )
+
+    output = torch.empty_like(query)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=query_len,
+        max_seqlen_k=kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=seq_threshold_3D,
+        num_par_softmax_segments=num_par_softmax_segments,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
