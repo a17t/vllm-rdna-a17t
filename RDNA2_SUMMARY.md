@@ -218,6 +218,41 @@ Also: Qwen3.5-0.8B is unusable as a fast repro vehicle on gfx1030
 (fp16 = numeric garbage on this small model, bf16 = no fdot2.bf16 ISA,
 fp32 = 192 GiB profiler OOM).
 
+## Round 5 (2026-08-18 night): rebase onto origin/main — perf retained, MTP still open
+
+Rebased main+rdna2 (45 commits) onto current origin/main (~650 upstream
+commits, incl. the Qwen3.5 MTP rework, mamba state-copy race fix, MTP
+all-reduce fusion). Build: `HIP_CLANG_PATH=/opt/rocm/lib/llvm/22/bin/
+TORCH_ROCM_ARCH=gfx1030 python setup.py develop`. Only 3 conflicts (envs,
+qwen_gdn_linear_attn, auto_awq — all "keep both sides"); 2 of our commits
+auto-dropped (already upstream).
+
+Validation:
+- unit suites: 264/265 (1 known parallel-load flake in test_gdn_rdna2,
+  passes standalone); MTP-attention regression tests 8/8
+- **non-spec server: 19.2 tok/s, output correct — all perf retained**
+- kernel selections correct (RDNA2TritonW4A16 + GEMV; upstream fused-CUDA
+  GDN kernel auto-falls-back to triton on gfx1030)
+
+MTP after rebase: STILL corrupt (period-3 duplication, acceptance 2.11).
+Root cause refined:
+1. The upstream rework (fused post-conv MTP decode kernel) is **BF16-only**
+   (dtype gate in `_fused_gdn_decode_unsupported_reason`); gfx1030 runs
+   fp16 (bf16 lacks fdot2 ISA for the Triton paths), so we can't inherit it.
+2. The MTP draft layer is **full_attention** (not GDN) -> the corruption is
+   in the TARGET's GDN spec state-slot handling: the fla spec kernel's
+   per-position state selection (`i_t = num_accepted_tokens - 1` slot read
+   in fused_recurrent/fused_sigmoid_gating) + `spec_state_indices_tensor`
+   construction/rollback in gdn_attn.py. ngram (no draft model, same
+   verify machinery minus GDN multi-token states) is byte-exact, which
+   brackets it precisely.
+3. Rebased MTP needs `max_cudagraph_capture_size` capped (e.g. 64): the
+   upstream graph-memory estimate for spec+FULL graphs is 11.14 GiB, else
+   KV cache sizing fails at 262144 ctx.
+
+Next session: token-trace `spec_state_indices_tensor` + state slots across
+verify rounds on the fp16 triton path.
+
 ## What's in the branch (25 commits)
 **Ported from the v0.23 fork (Phases 0–7):**
 - Platform detection (`on_gfx10x`), 6 HIP kernels (AWQ/GPTQ W4A16 GEMM, AWQ
