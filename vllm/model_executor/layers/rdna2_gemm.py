@@ -201,20 +201,6 @@ def rdna2_skinny_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return c
 
 
-def _w4a16_gemv_configs():
-    cfgs = []
-    for bn in (64, 128, 256):
-        for warps in (2, 4):
-            cfgs.append(
-                triton.Config({"BLOCK_N": bn}, num_warps=warps, num_stages=2)
-            )
-    return cfgs
-
-
-@triton.autotune(
-    configs=_w4a16_gemv_configs(),
-    key=["N", "K", "GROUP"],
-)
 @triton.jit
 def _w4a16_gemv_rdna2_kernel(
     x_ptr,  # [K] fp16/bf16 activations
@@ -229,17 +215,18 @@ def _w4a16_gemv_rdna2_kernel(
     HAS_ZP: tl.constexpr,
     ZP_BIAS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    GROUP: tl.constexpr,  # quant group size (multiple of BLOCK_K)
+    GROUP: tl.constexpr,  # quant group size (multiple of BLOCK_K, or
+    # BLOCK_K == 2 * GROUP)
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,  # == min group size
+    BLOCK_K: tl.constexpr,
 ):
     """y = x @ dequant(W).T + bias for a single row (M=1 decode GEMV).
 
     Same packed layout as ``triton_w4a16_gemm``; unpacks each int32 into 8
     N-nibbles with the interleave+shift scheme and applies the per-group
-    affine dequant inside the K loop. Measured ~171 GB/s effective on
-    gfx1030 at gs=32 (the documented ~31% MBU ceiling for W4A16 GEMV on
-    this part) — ~2.6x the generic tl.dot path at M=1.
+    affine dequant inside the K loop. When BLOCK_K spans two quant groups
+    (e.g. BLOCK_K=64 with GROUP=32) both group rows are loaded once and
+    selected per k with a where(), keeping scale/zero traffic minimal.
     """
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -250,6 +237,7 @@ def _w4a16_gemv_rdna2_kernel(
     shifts_row = tl.arange(0, 8) * 4
     shifts_2d = tl.broadcast_to(shifts_row[None, :], (BLOCK_N // 8, 8))
     shifts_1d = tl.reshape(shifts_2d, (BLOCK_N,))
+    DUAL_GROUP: tl.constexpr = BLOCK_K == 2 * GROUP
 
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for k0 in range(0, K, BLOCK_K):
@@ -267,18 +255,49 @@ def _w4a16_gemv_rdna2_kernel(
         w = (w >> shifts_1d[None, :]) & 0xF  # (BLOCK_K, BLOCK_N)
 
         g = k0 // GROUP
-        s = tl.load(s_ptr + g * N + offs_n, mask=n_mask, other=0.0).to(
+        s0 = tl.load(s_ptr + g * N + offs_n, mask=n_mask, other=0.0).to(
             tl.float32
         )
         if HAS_ZP:
-            z_packed = tl.load(z_ptr + g * N8 + offs_n8, mask=n8_mask, other=0)
-            z = tl.interleave(z_packed, z_packed)
-            z = tl.interleave(z, z)
-            z = tl.interleave(z, z)
-            z = (z >> shifts_1d) & 0xF
-            deq = (w.to(tl.float32) - z.to(tl.float32)[None, :]) * s[None, :]
+            z_p0 = tl.load(z_ptr + g * N8 + offs_n8, mask=n8_mask, other=0)
+
+        if DUAL_GROUP:
+            s1 = tl.load(
+                s_ptr + (g + 1) * N + offs_n, mask=n_mask, other=0.0
+            ).to(tl.float32)
+            if HAS_ZP:
+                z_p1 = tl.load(
+                    z_ptr + (g + 1) * N8 + offs_n8, mask=n8_mask, other=0
+                )
+            sel = ks >= (g + 1) * GROUP  # (BLOCK_K,)
+            s = tl.where(sel[:, None], s1[None, :], s0[None, :])
         else:
-            deq = (w.to(tl.float32) - ZP_BIAS) * s[None, :]
+            s = tl.broadcast_to(s0[None, :], (BLOCK_K, BLOCK_N))
+
+        if HAS_ZP:
+            if DUAL_GROUP:
+                z0 = tl.interleave(z_p0, z_p0)
+                z0 = tl.interleave(z0, z0)
+                z0 = tl.interleave(z0, z0)
+                z0 = (z0 >> shifts_1d) & 0xF
+                z1 = tl.interleave(z_p1, z_p1)
+                z1 = tl.interleave(z1, z1)
+                z1 = tl.interleave(z1, z1)
+                z1 = (z1 >> shifts_1d) & 0xF
+                z = tl.where(sel[:, None], z1[None, :], z0[None, :]).to(
+                    tl.float32
+                )
+            else:
+                z = tl.interleave(z_p0, z_p0)
+                z = tl.interleave(z, z)
+                z = tl.interleave(z, z)
+                z = (z >> shifts_1d) & 0xF
+                z = tl.broadcast_to(
+                    z.to(tl.float32)[None, :], (BLOCK_K, BLOCK_N)
+                )
+            deq = (w.to(tl.float32) - z) * s
+        else:
+            deq = (w.to(tl.float32) - ZP_BIAS) * s
         acc += tl.sum(deq * x[:, None], axis=0)
 
     if HAS_BIAS:
@@ -309,9 +328,18 @@ def rdna2_w4a16_gemv(
     if qzeros is not None:
         assert qzeros.shape == (K // group_size, N8)
 
+    # Deterministic launch config from a gfx1030 sweep (Qwen3.8 TP2
+    # shapes): BLOCK_N=32 everywhere; BLOCK_K=64 (dual gs=32 groups)
+    # when K allows; large-N shapes prefer 1 warp (more CTAs resident),
+    # small-N prefer 8 (k-parallel reduction).
+    block_k = 32
+    if K % 64 == 0 and (group_size == 32 or group_size % 64 == 0):
+        block_k = 64
+    warps = 1 if N > 8192 else 8
+
     x1 = x.reshape(K)
     y = torch.empty(N, dtype=x.dtype, device=x.device)
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)
+    grid = (triton.cdiv(N, 32),)
     _w4a16_gemv_rdna2_kernel[grid](
         x1,
         w_q,
@@ -326,6 +354,9 @@ def rdna2_w4a16_gemv(
         ZP_BIAS=zp_bias,
         HAS_BIAS=bias is not None,
         GROUP=group_size,
-        BLOCK_K=min(32, group_size),
+        BLOCK_N=32,
+        BLOCK_K=block_k,
+        num_warps=warps,
+        num_stages=2,
     )
     return y

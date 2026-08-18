@@ -138,6 +138,33 @@ see Phase-4 TODO below; `FP16_GEMV` had no effect on this checkpoint
 (GDN projections are unquantized but the lm_head/in_proj dominate was
 false — actual fp16 total was only ~33 ms of ~455 ms).
 
+## Round 2 (2026-08-18): decode 16.2 -> 19.1 tok/s (round total 2.2 -> 19.1, 8.7x)
+
+- `VLLM_RDNA2_FP16_GEMV=1` validated on the server: 14.5 -> 16.2 tok/s
+  (GDN in_proj/out_proj unquantized projections + lm_head through the
+  Triton GEMV; ~1040 GB/s on wide shapes).
+- W4A16 GEMV v2: exhaustive launch sweep (BLOCK_N/warps/stages/BLOCK_K)
+  found BLOCK_N=32 + BLOCK_K=64 universal winners. BLOCK_K=64 spans two
+  gs=32 quant groups, so the kernel now loads both group rows and selects
+  per-k with a where() (correctness vs the sweep's single-load variant).
+  Deterministic heuristic replaces the autotuner (Triton do_bench flushes
+  L2 and picked worse configs; autotune also costs capture time).
+  Kernel rates: gate/up 229, down 193, qkv 171, o_proj 184 GB/s effective
+  (was 171/116/93/111). Per-step int4 total ~28.6 -> ~18.8 ms.
+- MTP speculative decoding: mechanically working (acceptance 1.90 mean at
+  k=2, per-position 0.68/0.39; ~1.54 at k=1) BUT output corrupts after the
+  first accepted tokens on this GDN-hybrid model (diverges from non-spec
+  greedy continuation). High acceptance + divergence implicates the
+  target-side GDN state at verify time (state snapshot/rollback keyed by
+  num_accepted_tokens). PARKED - needs token-level tracing. Do not enable
+  MTP for serving until fixed.
+- OPEN BUG (Phase 4, same family): native GDN / paged-attn kernels produce
+  correct first token then garbage on Qwen3.8 (NATIVE_GDN=1 /
+  NATIVE_PAGED_ATTN=1). Both this and the MTP corruption are GDN
+  recurrent-state handling bugs; next session should trace state
+  snapshots at decode step boundaries (fla spec kernel state indexing vs
+  the gdn_attn metadata builder) and the native kernels' state updates.
+
 ## What's in the branch (25 commits)
 **Ported from the v0.23 fork (Phases 0–7):**
 - Platform detection (`on_gfx10x`), 6 HIP kernels (AWQ/GPTQ W4A16 GEMM, AWQ
