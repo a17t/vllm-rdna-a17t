@@ -192,6 +192,32 @@ false — actual fp16 total was only ~33 ms of ~455 ms).
   `--mamba-cache-mode=align` as a workaround config.
 - MTP remains DISABLED in the serve script until this is fixed.
 
+## Round 4 (2026-08-18 evening): MTP corruption isolated to the draft pass
+
+Systematic elimination on the 27B (byte-identical corruption each time):
+NOT local-argmax, NOT mamba-cache-mode (none vs align), NOT the upstream
+gates/launch fixes (cherry-picked 7f17ea4/0fa5fe4 anyway — correct hardening),
+NOT our fla launch tuning (reverted ab58787), NOT mixed batches.
+
+**Key result: ngram speculative decoding is byte-exact vs non-spec greedy**
+(primes prompt) — the verification/sampling/KV machinery is CORRECT. The
+corruption is specific to the MTP DRAFT pass (draft+target agree on a
+poisoned context; period-(k+1) token duplication = state/KV advanced past
+accepted positions). Diffed every spec-path file (qwen_gdn_linear_attn,
+gdn_attn, step3p5/llm_base proposers, fla kernels) against origin/main:
+functionally identical — the bug very likely persists upstream on this
+base; upstream meanwhile reworked the path (fused CUDA post-conv MTP
+decode kernel #51674 + head-ratio support #52539, both requiring files we
+lack).
+
+Recommended path to correct 28 tok/s MTP serving: rebase main+rdna2 onto
+current origin/main (~589 commits, absorbs the Qwen3.5 MTP rework), then
+re-validate. MTP stays disabled until then.
+
+Also: Qwen3.5-0.8B is unusable as a fast repro vehicle on gfx1030
+(fp16 = numeric garbage on this small model, bf16 = no fdot2.bf16 ISA,
+fp32 = 192 GiB profiler OOM).
+
 ## What's in the branch (25 commits)
 **Ported from the v0.23 fork (Phases 0–7):**
 - Platform detection (`on_gfx10x`), 6 HIP kernels (AWQ/GPTQ W4A16 GEMM, AWQ
