@@ -1,4 +1,76 @@
 <!-- markdownlint-disable MD001 MD041 -->
+<!-- ---------------------------------------------------------------------------
+     A17T RDNA2 fork README prefix
+---------------------------------------------------------------------------- -->
+
+# A17T vLLM RDNA2 fork (`main+rdna2`)
+
+vLLM ported and tuned for **AMD RDNA2 (gfx1030, Radeon PRO V620)**, maintained
+by A17T. This branch is based on upstream `main` (post-v0.26.1rc0) and carries
+the RDNA2 enablement, native kernels, and decode optimizations below.
+
+## What we did
+
+1. **RDNA2 platform bring-up**: gfx10x detection, MPLinear/kernel choosers,
+   6 native HIP kernels (AWQ/GPTQ W4A16 GEMM, AWQ MoE, GDN decode, paged
+   attention), fast-startup/compile fixes, TurboQuant FP8 guards.
+2. **Decode optimizations** (measured on `cyankiwi/Qwen3.8-27B-AWQ-INT4`,
+   compressed-tensors W4 group_size=32, TP2, single-request, short context):
+   - rdna2 fp16 GEMV for unquantized M=1 projections (9% -> ~30%+ MBU)
+   - **W4A16 M=1 GEMV** over the packed-int4 layout with per-group affine
+     dequant, dispatched via an opaque custom op (`vllm.rdna2_w4a16_linear`)
+     so the M==1 branch executes with the real runtime M at CUDA-graph
+     capture (dynamic-shape guards are not re-evaluated at runtime)
+   - deterministic launch heuristics after exhaustive on-device sweeps
+     (Triton's do_bench L2-flush picks measurably worse configs)
+3. **gfx906-mobydick port** (adapted from
+   `ai-infos/vllm-gfx906-mobydick`): MTP attention correctness fixes
+   (query_mask_1 padding rows, tile-loop bounds, 3D split-softmax for
+   multi-token decode), Torch SDPA fallback paths, NCCL/graph-capture
+   stability workarounds, FP8 emulation (fp16 activations + bitwise E4M3
+     decode — no `tl.float8` in IR, which crashes Triton on gfx1030), GDN
+   kernel launch tuning.
+
+## Results
+
+| date | config | tok/s (decode, batch 1) |
+|---|---|---|
+| 2026-08-17 | baseline (your command, original tree) | 2.2 |
+| 2026-08-17 | + W4A16 GEMV + opaque dispatch + kernel gates | 14.5 |
+| 2026-08-18 | + `VLLM_RDNA2_FP16_GEMV=1` | 16.2 |
+| 2026-08-18 | + GEMV v2 (BN=32/BK=64 dual-group heuristic) | **19.1** |
+
+Effective kernel bandwidth of the int4 GEMV went 11-24 GB/s (native kernel at
+gs=32) to **171-229 GB/s**. Weight-bandwidth roofline for this setup is
+~55-65 tok/s; the remaining gap is the int4 GEMV instruction cost, attention,
+and framework overhead. Earlier Qwen3.6-27B-AWQ (AutoAWQ gs=128) work also
+produced 9 -> 24 tok/s via the fp16 GEMV alone (see `RDNA2_SUMMARY.md`).
+
+## Open items
+
+- **GDN recurrent-state bugs (Phase 4)**: (a) the native GDN / paged-attn
+  kernels emit a correct first token then garbage on Qwen3.8; (b) MTP
+  speculative decoding accepts drafts (mean acceptance ~1.9 at k=2) but
+  corrupts output after the first accepted tokens — the target-side GDN state
+  at verify time is the suspect. Both families block enabling the natives and
+  MTP for serving; both are documented in `RDNA2_SUMMARY.md`.
+- Long-context decode (paged attention) and batch scaling after that.
+
+## Usage
+
+See `serve_q38_27b.sh` (validated serve config) and `RDNA2_SUMMARY.md`
+(full investigation notes, env table, build/test workflow). Key env toggles:
+`VLLM_RDNA2_FP16_GEMV`, `VLLM_RDNA2_NATIVE_GDN`, `VLLM_RDNA2_NATIVE_AWQ`,
+`VLLM_RDNA2_NATIVE_PAGED_ATTN`, `VLLM_RDNA2_TRITON_ATTN_TUNING`,
+`VLLM_TRITON_ATTN_NUM_PAR_SOFTMAX_SEGMENTS`, `VLLM_TORCH_SDPA_*`.
+
+First startup after code changes takes ~10 min (fresh AOT compile + Triton
+autotune); the cache is warm per config afterwards.
+
+<!-- ---------------------------------------------------------------------------
+     Upstream vLLM README follows
+---------------------------------------------------------------------------- -->
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
