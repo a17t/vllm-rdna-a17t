@@ -360,3 +360,171 @@ def rdna2_w4a16_gemv(
         num_stages=2,
     )
     return y
+
+
+def _w4a16_gemv_m_configs():
+    cfgs = []
+    for bn in (32, 64):
+        for warps in (1, 4, 8):
+            cfgs.append(
+                triton.Config({"BLOCK_N": bn}, num_warps=warps, num_stages=2)
+            )
+    return cfgs
+
+
+@triton.jit
+def _w4a16_gemv_m_rdna2_kernel(
+    x_ptr,  # [M, K] fp16/bf16 activations (M small, <= BLOCK_M)
+    w_ptr,  # [K, N//8] int32, N-packed nibbles
+    s_ptr,  # [K//GROUP, N] scales
+    z_ptr,  # [K//GROUP, N//8] packed zeros if HAS_ZP
+    b_ptr,  # [N] bias if HAS_BIAS
+    y_ptr,  # [M, N] output
+    N,
+    K,
+    N8,
+    M,
+    HAS_ZP: tl.constexpr,
+    ZP_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # padded M (power of 2 >= actual M)
+):
+    """y = x @ dequant(W).T + bias for a few rows (M <= BLOCK_M <= 4).
+
+    Same layout/dequant scheme as the M=1 GEMV; weight loads are shared
+    across the M rows, so small-M verify batches (spec decode k<=3) cost
+    little more than a single-row GEMV.
+    """
+    pid = tl.program_id(0)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n8 = pid * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
+    n_mask = offs_n < N
+    n8_mask = offs_n8 < N8
+    m_mask = offs_m < M
+
+    shifts_row = tl.arange(0, 8) * 4
+    shifts_2d = tl.broadcast_to(shifts_row[None, :], (BLOCK_N // 8, 8))
+    shifts_1d = tl.reshape(shifts_2d, (BLOCK_N,))
+    DUAL_GROUP: tl.constexpr = BLOCK_K == 2 * GROUP
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        ks = k0 + tl.arange(0, BLOCK_K)
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + ks[None, :],
+            mask=m_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+
+        w_packed = tl.load(
+            w_ptr + ks[:, None] * N8 + offs_n8[None, :],
+            mask=n8_mask[None, :],
+            other=0,
+        )
+        w = tl.interleave(w_packed, w_packed)
+        w = tl.interleave(w, w)
+        w = tl.interleave(w, w)
+        w = (w >> shifts_1d[None, :]) & 0xF  # (BLOCK_K, BLOCK_N)
+
+        g = k0 // GROUP
+        s0 = tl.load(s_ptr + g * N + offs_n, mask=n_mask, other=0.0).to(
+            tl.float32
+        )
+        if HAS_ZP:
+            z_p0 = tl.load(z_ptr + g * N8 + offs_n8, mask=n8_mask, other=0)
+
+        if DUAL_GROUP:
+            s1 = tl.load(
+                s_ptr + (g + 1) * N + offs_n, mask=n_mask, other=0.0
+            ).to(tl.float32)
+            if HAS_ZP:
+                z_p1 = tl.load(
+                    z_ptr + (g + 1) * N8 + offs_n8, mask=n8_mask, other=0
+                )
+            sel = ks >= (g + 1) * GROUP
+            s = tl.where(sel[:, None], s1[None, :], s0[None, :])
+        else:
+            s = tl.broadcast_to(s0[None, :], (BLOCK_K, BLOCK_N))
+
+        if HAS_ZP:
+            if DUAL_GROUP:
+                z0 = tl.interleave(z_p0, z_p0)
+                z0 = tl.interleave(z0, z0)
+                z0 = tl.interleave(z0, z0)
+                z0 = (z0 >> shifts_1d) & 0xF
+                z1 = tl.interleave(z_p1, z_p1)
+                z1 = tl.interleave(z1, z1)
+                z1 = tl.interleave(z1, z1)
+                z1 = (z1 >> shifts_1d) & 0xF
+                z = tl.where(sel[:, None], z1[None, :], z0[None, :]).to(
+                    tl.float32
+                )
+            else:
+                z = tl.interleave(z_p0, z_p0)
+                z = tl.interleave(z, z)
+                z = tl.interleave(z, z)
+                z = (z >> shifts_1d) & 0xF
+                z = tl.broadcast_to(
+                    z.to(tl.float32)[None, :], (BLOCK_K, BLOCK_N)
+                )
+            deq = (w.to(tl.float32) - z) * s
+        else:
+            deq = (w.to(tl.float32) - ZP_BIAS) * s
+        # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) via broadcast+sum
+        acc += tl.sum(x[:, :, None] * deq[None, :, :], axis=1)
+
+    if HAS_BIAS:
+        acc += tl.load(b_ptr + offs_n, mask=n_mask, other=0.0).to(
+            tl.float32
+        )[None, :]
+    tl.store(
+        y_ptr + offs_m[:, None] * N + offs_n[None, :],
+        acc.to(y_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def rdna2_w4a16_gemv_m(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+    group_size: int,
+    zp_bias: int = 8,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Small-M (<= 4) W4A16 GEMV sharing weight loads across rows."""
+    M, K = x.shape
+    N = w_q.shape[1] * 8
+    N8 = N // 8
+    block_m = max(2, triton.next_power_of_2(M))
+    block_k = 64 if (K % 64 == 0 and group_size in (32, 64)) else 32
+    # M>1 sweep winner on gfx1030: BN=32/warps=4/bk=64 uniformly
+    warps = 4
+    y = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    _w4a16_gemv_m_rdna2_kernel[(triton.cdiv(N, 32),)](
+        x,
+        w_q,
+        scales,
+        qzeros if qzeros is not None else w_q,
+        bias if bias is not None else x.reshape(-1)[:1],
+        y,
+        N,
+        K,
+        N8,
+        M,
+        HAS_ZP=qzeros is not None,
+        ZP_BIAS=zp_bias,
+        HAS_BIAS=bias is not None,
+        GROUP=group_size,
+        BLOCK_N=32,
+        BLOCK_K=block_k,
+        BLOCK_M=block_m,
+        num_warps=warps,
+        num_stages=2,
+    )
+    return y

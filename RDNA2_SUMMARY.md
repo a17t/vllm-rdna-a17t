@@ -165,6 +165,33 @@ false — actual fp16 total was only ~33 ms of ~455 ms).
   snapshots at decode step boundaries (fla spec kernel state indexing vs
   the gdn_attn metadata builder) and the native kernels' state updates.
 
+## Round 3 (2026-08-18): multi-row W4A16 GEMV + MTP status
+
+- **Attribution (52.3 ms/step at 19.1 tok/s)**: int4 GEMVs ~18.8 ms,
+  fp16 projections ~12 ms, fla GDN ~4 ms, TP2 allreduces **4.75 ms**
+  (measured: 128 x ~37 us NCCL ops; custom-AR unavailable on this
+  platform — one-shot AR would save ~3 ms), remainder ~13 ms attention +
+  overhead.
+- **Multi-row W4A16 GEMV** (`rdna2_w4a16_gemv_m`, M<=4): spec-decode
+  verify batches (M=1+k) previously fell off the M=1 fast path to the
+  tl.dot GEMM (~3.5x slower). The M-row kernel shares weight loads across
+  rows; sweep winner BN=32/warps=4/BK=64 uniformly (127/169/98/87 us at
+  M=3 vs 648/549/275/264 us tl.dot). Dispatched in the opaque op for
+  1<=M<=4.
+- **MTP measured with fast verify: 25.8-28.1 tok/s** (vs 19.1 non-spec,
+  +47%) — but **output is corrupted**: token duplication ("2, 2, 3, 3,
+  3333..." for a primes prompt vs a correct non-spec listing). High
+  acceptance (1.93) + divergence from true greedy = draft and target
+  share the same wrong state. Localization: GDN spec state-slot
+  machinery — the fla spec kernel reads per-position state slots
+  (`spec_state_indices` + `num_accepted_tokens`); the state
+  snapshot/rollback postprocess (`postprocess_mamba_align_gpu`) is only
+  wired for `mamba_cache_mode="all"` while we run "none" (prefix caching
+  off). Upstream has no e2e GDN+MTP test (test_mtp.py is mock-based).
+  Next session: trace state slots across verify steps; try
+  `--mamba-cache-mode=align` as a workaround config.
+- MTP remains DISABLED in the serve script until this is fixed.
+
 ## What's in the branch (25 commits)
 **Ported from the v0.23 fork (Phases 0–7):**
 - Platform detection (`on_gfx10x`), 6 HIP kernels (AWQ/GPTQ W4A16 GEMM, AWQ

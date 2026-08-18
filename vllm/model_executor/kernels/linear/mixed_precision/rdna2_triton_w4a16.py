@@ -42,15 +42,22 @@ def _rdna2_w4a16_linear_impl(
     would be baked out of the traced graph).
     """
     if (
-        x.shape[0] == 1
+        1 <= x.shape[0] <= 4
         and x.shape[1] % 32 == 0
         and group_size in (32, 64, 128, 256)
     ):
-        from vllm.model_executor.layers.rdna2_gemm import rdna2_w4a16_gemv
+        from vllm.model_executor.layers.rdna2_gemm import (
+            rdna2_w4a16_gemv,
+            rdna2_w4a16_gemv_m,
+        )
 
-        return rdna2_w4a16_gemv(
+        if x.shape[0] == 1:
+            return rdna2_w4a16_gemv(
+                x, w_q, w_s, w_zp, group_size, zp_bias, bias
+            ).unsqueeze(0)
+        return rdna2_w4a16_gemv_m(
             x, w_q, w_s, w_zp, group_size, zp_bias, bias
-        ).unsqueeze(0)
+        )
 
     out = triton_w4a16_gemm(x, w_q, w_s, w_zp, group_size, zp_bias)
     if bias is not None:

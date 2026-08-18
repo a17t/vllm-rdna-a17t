@@ -149,3 +149,36 @@ def test_rdna2_w4a16_gemv(N, K, gs, has_zp):
     ref = x.float() @ w_deq.T
     torch.testing.assert_close(out.float(), ref, atol=2e-1, rtol=2e-2)
     assert out.isfinite().all()
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx10x()),
+    reason="Requires RDNA2 (gfx1030)",
+)
+@pytest.mark.parametrize("M", [2, 3, 4])
+@pytest.mark.parametrize("N,K,gs", [(8704, 5120, 32), (5120, 8704, 32)])
+def test_rdna2_w4a16_gemv_m(M, N, K, gs):
+    """Small-M W4A16 GEMV (spec-decode verify batches) vs dequant ref."""
+    from vllm.model_executor.layers.rdna2_gemm import rdna2_w4a16_gemv_m
+
+    def pack_along_last(t):
+        R, C = t.shape
+        out = torch.zeros(R, C // 8, dtype=torch.int32, device=t.device)
+        for i in range(8):
+            out |= t[:, i::8].to(torch.int32) << (4 * i)
+        return out.contiguous()
+
+    torch.manual_seed(0)
+    w4 = torch.randint(0, 16, (N, K), dtype=torch.int32, device=DEVICE)
+    qweight = pack_along_last(w4.t().contiguous())
+    scales = torch.rand(K // gs, N, dtype=torch.float16, device=DEVICE) * 0.01 + 0.005
+    zeros_v = torch.randint(0, 16, (K // gs, N), dtype=torch.int32, device=DEVICE)
+    qzeros = pack_along_last(zeros_v)
+    x = torch.randn(M, K, dtype=torch.float16, device=DEVICE) * 0.1
+    out = rdna2_w4a16_gemv_m(x, qweight, scales, qzeros, gs, 8)
+    z_nk = zeros_v.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    s_nk = scales.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    w_deq = (w4.to(torch.float32) - z_nk) * s_nk
+    ref = x.float() @ w_deq.T
+    torch.testing.assert_close(out.float(), ref, atol=2e-1, rtol=2e-2)
+    assert out.isfinite().all()
