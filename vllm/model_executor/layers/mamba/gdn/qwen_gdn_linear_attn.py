@@ -179,6 +179,8 @@ def _rdna2_conv1d_update_spec(
     bias: torch.Tensor | None,
     conv_state_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor | None = None,
+    max_query_len: int = -1,
 ) -> torch.Tensor:
     """Single-launch ragged conv1d for spec-decode via native HIP kernel.
 
@@ -189,7 +191,8 @@ def _rdna2_conv1d_update_spec(
     from vllm import _custom_ops as _gdn_ops
 
     return _gdn_ops.gdn_conv1d_update_spec_rdna2(
-        x, weight, bias, conv_state, conv_state_indices, query_start_loc
+        x, weight, bias, conv_state, conv_state_indices, query_start_loc,
+        num_accepted_tokens, max_query_len,
     )
 
 
@@ -1522,6 +1525,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
             ]
             if _GDN_RDNA2_CONV1D_AVAILABLE:
+                # Native anchored spec conv: window init at state[a..a+2]
+                # (a = num_accepted-1), state shift a+1 with the query
+                # tail — matches the reference kernel exactly (unit-tested
+                # for accepted in {1,2,3} in test_gdn_rdna2.py).
                 mixed_qkv_spec = _rdna2_conv1d_update_spec(
                     mixed_qkv_spec,
                     conv_state,
@@ -1532,6 +1539,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                         + 1
                     ],
+                    num_accepted_tokens,
+                    spec_state_indices_tensor.size(-1),
                 )
             else:
                 mixed_qkv_spec = causal_conv1d_update(

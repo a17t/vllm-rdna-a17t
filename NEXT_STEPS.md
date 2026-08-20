@@ -1,10 +1,44 @@
-# NEXT STEPS — parked work items (updated 2026-08-18)
+# NEXT STEPS — parked work items (updated 2026-08-20)
 
-## Item 1 (ACTIVE): MTP correctness — GDN spec state-slot bug
+## Item 1 (DONE 2026-08-20): MTP correctness — ROOT CAUSE FOUND & FIXED
 
-**Goal**: make MTP speculative decoding byte-exact vs non-spec greedy on
-Qwen3.8-27B-AWQ-INT4 (fp16, TP2, gfx1030). Unlocks ~28 tok/s serving
-(measured: 25-28 tok/s when MTP on, but output corrupt).
+**Root cause**: the RDNA2 native spec conv kernel
+(`gdn_conv1d_update_spec_rdna2`) had NO rejection anchoring: after a
+rejection it left rejected drafts in the conv window (phantom-context
+corruption; period-(k+1) duplication from the first rejection; target
+argmax emitted previously-drafted tokens). Phase-B/C tracing proved:
+corruption onset == first rejected round; the ssm path (fla) was already
+anchored correctly; only the conv was wrong.
+
+**Fix**: anchored native kernel (window init at state[a..a+2], a =
+num_accepted-1; state shift a+1 with query tail; effective state_len =
+width-1+maxq-1) — unit-tested against the Triton reference for accepted
+in {1,2,3} (6/6). GOTCHAS that cost hours: the reference runs IN-PLACE
+on x, and expects x as [tokens, dim] (strides), so test harnesss must
+clone per call and NOT transpose.
+
+**Validated**: primes byte-correct ("2, 3, 5, 7, 11, 13, 17, 19, 23..."),
+coherent rivers think-text, acceptance 2.8, non-spec control 25.16 tok/s.
+
+## Item 1b (NEW, ACTIVE): MTP throughput regression — correct-but-slow
+
+Correct MTP runs at 2.5 tok/s (~1.1 s/step) vs corrupted-but-fast 25 tok/s
+(81 ms/step) pre-fix. Evidence gathered:
+- py-spy: 86% of worker time blocked in
+  `num_accepted_tokens_event.synchronize()` (gpu_model_runner.py:2177)
+  + `torch.accelerator.synchronize` (:1219) — GPU queue is the long pole
+- GPU shows 99% busy (amd-smi) — possibly NCCL spin (TORCH_NCCL_BLOCKING_WAIT=1
+  from our rocm.py workaround) rather than real work
+- BOTH the reference Triton conv and the anchored native conv are equally
+  slow -> NOT kernel cost; slowdown correlates with CORRECT spec semantics
+  (acceptance 2.8 vs 2.1), i.e. something downstream of correct anchoring
+- conv kernel itself: 4.2us/call captured, 76us eager — exonerated
+- non-spec control on same build: 25.16 tok/s — exonerated globally
+Next: profile the GPU queue composition during a step (rocprof attach or
+in-server event timing around drafter proposal); check whether the draft
+forward's eager NCCL collectives serialize with the graph replays; test
+with TORCH_NCCL_BLOCKING_WAIT unset; consider capping mamba spec blocks.
+MTP stays OFF in serve_q38_27b.sh until this lands.
 
 ### Root-cause bracket (all evidence from this branch)
 

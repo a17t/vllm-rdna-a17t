@@ -292,6 +292,31 @@ project — credit for the kernel design and bandwidth strategy).
   dominated by fp16 projections (~12 ms incl. lm_head ~3 ms at 443
   GB/s), allreduce 4.75 ms, GDN core 4 ms, attention + overhead.
 
+## Round 7 (2026-08-20): MTP root cause found and FIXED (correctness)
+
+The MTP corruption (period-(k+1) duplication from the first rejection,
+acceptance ~2.1 with draft+target agreeing on poisoned context) was the
+RDNA2 native spec conv kernel lacking rejection anchoring: after a
+rejection it left the REJECTED drafts in the conv window, so the next
+verify read phantom context (the target's own argmax then re-emitted
+previously drafted tokens — matching every observed signature).
+Phase-B round tracing proved onset == first rejected round; the fla
+ssm kernel was already anchored; ngram never enters the spec GDN path.
+
+Fix: anchored `gdn_conv1d_update_spec_rdna2` (num_accepted_tokens +
+max_query_len args; window init at state[a..a+2], a = accepted-1; state
+shift a+1 + query tail; effective state_len = width-1+maxq-1 matching
+the reference wrapper). Unit-tested 6/6 vs the Triton reference for
+accepted in {1,2,3}. Two test-harness gotchas documented in NEXT_STEPS
+(reference mutates x in place; x must be [tokens, dim]).
+
+Validated: primes byte-correct, coherent outputs, acceptance 2.80,
+non-spec control unaffected (25.16 tok/s). MTP THROUGHPUT still regressed
+(2.5 tok/s; ~1.1 s/step; 86% worker time in accepted-counts event sync;
+GPU 99% busy — suspected NCCL spin interplay). MTP remains disabled in
+the serve script until Item 1b (NEXT_STEPS.md) lands. All RDNA2 suites
+green (267/267 affected + full GDN 26/26).
+
 ## What's in the branch (25 commits)
 **Ported from the v0.23 fork (Phases 0–7):**
 - Platform detection (`on_gfx10x`), 6 HIP kernels (AWQ/GPTQ W4A16 GEMM, AWQ

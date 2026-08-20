@@ -85,8 +85,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // GDN ragged conv1d_update for RDNA2 spec-decode (variable-length sequences).
   rocm_ops.def(
       "gdn_conv1d_update_spec_rdna2(Tensor x, Tensor weight, Tensor? bias, "
-      "Tensor conv_state, Tensor conv_state_indices, Tensor query_start_loc) "
-      "-> Tensor");
+      "Tensor conv_state, Tensor conv_state_indices, Tensor query_start_loc, "
+      "Tensor? num_accepted, int max_query_len) -> Tensor");
   rocm_ops.impl("gdn_conv1d_update_spec_rdna2", torch::kCUDA,
                 &gdn_conv1d_update_spec_rdna2);
 

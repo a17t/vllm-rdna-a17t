@@ -77,7 +77,8 @@ torch::Tensor gdn_conv1d_update_rdna2(
 torch::Tensor gdn_conv1d_update_spec_rdna2(
     torch::Tensor x, torch::Tensor weight,
     const std::optional<torch::Tensor>& bias, torch::Tensor conv_state,
-    torch::Tensor conv_state_indices, torch::Tensor query_start_loc);
+    torch::Tensor conv_state_indices, torch::Tensor query_start_loc,
+    std::optional<torch::Tensor> num_accepted, int64_t max_query_len);
 
 void gdn_sigmoid_gating_delta_rule_update_rdna2(
     torch::Tensor A_log, torch::Tensor a, torch::Tensor b,

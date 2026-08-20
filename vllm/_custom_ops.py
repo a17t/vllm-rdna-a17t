@@ -746,9 +746,12 @@ def gdn_conv1d_update_spec_rdna2(
     conv_state: torch.Tensor,
     conv_state_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
+    num_accepted: torch.Tensor | None = None,
+    max_query_len: int = -1,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.gdn_conv1d_update_spec_rdna2(
-        x, weight, bias, conv_state, conv_state_indices, query_start_loc
+        x, weight, bias, conv_state, conv_state_indices, query_start_loc,
+        num_accepted, max_query_len,
     )
 
 
@@ -764,6 +767,8 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         conv_state: torch.Tensor,
         conv_state_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        num_accepted: torch.Tensor | None,
+        max_query_len: int,
     ) -> torch.Tensor:
         return torch.empty_like(x)
 

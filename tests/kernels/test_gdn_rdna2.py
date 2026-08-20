@@ -573,3 +573,42 @@ def test_sigmoid_gating_multi_step_correctness():
         atol = 0.05
         assert cs_diff < atol, f"State diverged at step {step}: diff={cs_diff}"
         assert out_diff < atol, f"Output diverged at step {step}: diff={out_diff}"
+
+
+@pytest.mark.parametrize("accepted", [1, 2, 3])
+@pytest.mark.parametrize("state_len", [6, 7])
+def test_conv1d_update_spec_anchored_vs_reference(accepted, state_len):
+    """Anchored native spec conv must match the Triton reference for
+    every acceptance count (rejection anchoring)."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_update,
+    )
+
+    torch.manual_seed(0)
+    dim, w, seqlen = 256, 4, 3
+    dev = "cuda"
+    x = torch.randn(seqlen, dim, dtype=torch.float16, device=dev) * 0.2  # [tok, dim]
+    weight = torch.randn(dim, w, dtype=torch.float16, device=dev) * 0.2
+    bias = torch.randn(dim, dtype=torch.float16, device=dev) * 0.1
+    st_a = torch.randn(8, dim, state_len, dtype=torch.float16, device=dev)
+    st_b = st_a.clone()
+    csi = torch.tensor([1], dtype=torch.int32, device=dev)
+    qsl = torch.tensor([0, seqlen], dtype=torch.int32, device=dev)
+    na = torch.tensor([accepted], dtype=torch.int32, device=dev)
+
+    # the reference runs in-place on x (out=None) — clone per call
+    ref = causal_conv1d_update(
+        x.clone(), st_a, weight, bias, activation="silu",
+        conv_state_indices=csi, num_accepted_tokens=na,
+        query_start_loc=qsl, max_query_len=seqlen, validate_data=False,
+    )
+    out = ops.gdn_conv1d_update_spec_rdna2(
+        x.clone(), weight, bias, st_b, csi, qsl, na, seqlen,
+    )
+    torch.testing.assert_close(
+        out.float(), ref.float(), atol=2e-2, rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        st_b.float(), st_a.float(), atol=2e-2, rtol=2e-2,
+    )
