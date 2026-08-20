@@ -138,6 +138,10 @@ if TYPE_CHECKING:
     # weight repack raises load memory, and AWQ is not the decode bottleneck
     # (the Triton AWQ path is equally fast). Set to 1 to enable for validation.
     VLLM_RDNA2_NATIVE_AWQ: bool = False
+    # RDNA2: use the K-packed HIP W4A16 GEMV (gemv_w4_kpack) for M=1
+    # decode and store int4 weights in its [K//8, N] layout (~3x the
+    # Triton GEMV on wide shapes). Set to 0 for the Triton layout/path.
+    VLLM_RDNA2_W4_KPACK: bool = True
     # RDNA2: use the Triton fp16 GEMV (rdna2_gemv) for M=1 unquantized
     # projections. Set to 0 to fall back to torch.nn.functional.linear.
     VLLM_RDNA2_FP16_GEMV: bool = True
@@ -1257,6 +1261,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_RDNA2_NATIVE_AWQ": lambda: bool(
         int(os.getenv("VLLM_RDNA2_NATIVE_AWQ", "0"))
+    ),
+    "VLLM_RDNA2_W4_KPACK": lambda: bool(
+        int(os.getenv("VLLM_RDNA2_W4_KPACK", "1"))
     ),
     "VLLM_RDNA2_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_RDNA2_FP16_GEMV", "1"))

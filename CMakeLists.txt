@@ -1535,6 +1535,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_SRC
       "csrc/rocm/q_gemm_rdna2.cu"
       "csrc/rocm/awq_gemm_rdna2.cu"
+      "csrc/rocm/gemv_w4_kpack_rdna2.cu"
       "csrc/rocm/gdn_decode_rdna2.cu"
       "csrc/rocm/moe_awq_gemm_rdna2.cu")
   endif()

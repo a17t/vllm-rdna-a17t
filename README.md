@@ -38,7 +38,8 @@ the RDNA2 enablement, native kernels, and decode optimizations below.
 | 2026-08-17 | baseline (your command, original tree) | 2.2 |
 | 2026-08-17 | + W4A16 GEMV + opaque dispatch + kernel gates | 14.5 |
 | 2026-08-18 | + `VLLM_RDNA2_FP16_GEMV=1` | 16.2 |
-| 2026-08-18 | + GEMV v2 (BN=32/BK=64 dual-group heuristic) | **19.1** |
+| 2026-08-18 | + GEMV v2 (BN=32/BK=64 dual-group heuristic) | 19.1 |
+| 2026-08-19 | + HIP K-packed W4A16 GEMV (streaming loads, split-K) | **25.2** |
 
 Effective kernel bandwidth of the int4 GEMV went 11-24 GB/s (native kernel at
 gs=32) to **171-229 GB/s**. Weight-bandwidth roofline for this setup is

@@ -31,6 +31,15 @@ torch::Tensor gptq_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
 torch::Tensor awq_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
                              torch::Tensor b_qzeros, torch::Tensor b_scales);
 
+// K-packed M=1 W4A16 dequant-GEMV (gfx1030). wq [K//8, N] uint32 packed
+// along K; s [K//G, N] half; z [K//G, N] uint8 (or constant zp bias).
+torch::Tensor gemv_w4_kpack(torch::Tensor a, torch::Tensor wq, torch::Tensor s,
+                            torch::Tensor z, int64_t group_size,
+                            int64_t split_groups);
+torch::Tensor gemv_w4_kpack_sym(torch::Tensor a, torch::Tensor wq,
+                                torch::Tensor s, int64_t group_size,
+                                int64_t split_groups, double zp_bias);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               torch::Tensor b_g_idx, bool use_v2_format);

@@ -639,6 +639,59 @@ def awq_gemm_rdna2(
     return torch.ops._rocm_C.awq_gemm_rdna2(a, b_q_weight, b_qzeros, b_scales)
 
 
+def gemv_w4_kpack(
+    a: torch.Tensor,
+    wq: torch.Tensor,
+    s: torch.Tensor,
+    z: torch.Tensor,
+    group_size: int,
+    split_groups: int = 4,
+) -> torch.Tensor:
+    """K-packed M=1 W4A16 GEMV (gfx1030). wq [K//8, N] int32, s [K//G, N],
+    z [K//G, N] uint8."""
+    return torch.ops._rocm_C.gemv_w4_kpack(a, wq, s, z, group_size,
+                                           split_groups)
+
+
+def gemv_w4_kpack_sym(
+    a: torch.Tensor,
+    wq: torch.Tensor,
+    s: torch.Tensor,
+    group_size: int,
+    zp_bias: float = 8.0,
+    split_groups: int = 4,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.gemv_w4_kpack_sym(a, wq, s, group_size,
+                                               split_groups, zp_bias)
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gemv_w4_kpack"):
+
+    @register_fake("_rocm_C::gemv_w4_kpack")
+    def _gemv_w4_kpack_fake(
+        a: torch.Tensor,
+        wq: torch.Tensor,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        group_size: int,
+        split_groups: int,
+    ) -> torch.Tensor:
+        return torch.empty((a.size(0), s.size(1)), dtype=a.dtype,
+                           device=a.device)
+
+    @register_fake("_rocm_C::gemv_w4_kpack_sym")
+    def _gemv_w4_kpack_sym_fake(
+        a: torch.Tensor,
+        wq: torch.Tensor,
+        s: torch.Tensor,
+        group_size: int,
+        split_groups: int,
+        zp_bias: float,
+    ) -> torch.Tensor:
+        return torch.empty((a.size(0), s.size(1)), dtype=a.dtype,
+                           device=a.device)
+
+
 if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "awq_gemm_rdna2"):
 
     @register_fake("_rocm_C::awq_gemm_rdna2")

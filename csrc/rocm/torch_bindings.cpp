@@ -65,6 +65,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor b_scales) -> Tensor");
   rocm_ops.impl("awq_gemm_rdna2", torch::kCUDA, &awq_gemm_rdna2);
 
+  // K-packed M=1 W4A16 dequant-GEMV (gfx1030).
+  rocm_ops.def(
+      "gemv_w4_kpack(Tensor a, Tensor wq, Tensor s, Tensor z, int "
+      "group_size, int split_groups) -> Tensor");
+  rocm_ops.impl("gemv_w4_kpack", torch::kCUDA, &gemv_w4_kpack);
+  rocm_ops.def(
+      "gemv_w4_kpack_sym(Tensor a, Tensor wq, Tensor s, int group_size, "
+      "int split_groups, float zp_bias) -> Tensor");
+  rocm_ops.impl("gemv_w4_kpack_sym", torch::kCUDA, &gemv_w4_kpack_sym);
+
   // GDN causal_conv1d_update for RDNA2 (gfx1030).
   rocm_ops.def(
       "gdn_conv1d_update_rdna2(Tensor x, Tensor weight, Tensor? bias, "

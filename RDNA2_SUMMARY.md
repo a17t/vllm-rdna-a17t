@@ -253,6 +253,45 @@ Root cause refined:
 Next session: token-trace `spec_state_indices_tensor` + state slots across
 verify rounds on the fp16 triton path.
 
+## Round 6 (2026-08-19): HIP K-packed W4A16 GEMV — 19.2 -> 25.2 tok/s
+
+Ported the hand-written HIP M=1 W4A16 dequant-GEMV from
+sebastianmechno-sys/vllm-rocm-windows-rdna2 (Apache-2.0; RX-6000 Windows
+project — credit for the kernel design and bandwidth strategy).
+
+- **Kernel** (`csrc/rocm/gemv_w4_kpack_rdna2.cu`): K-packed weights
+  [K//8, N] (8 consecutive K values per int32, vs our Triton layout's
+  N-packing), lane->N thread ownership with COLS=4 (one 16-byte
+  dwordx4 per k-row, 512B coalesced), `__builtin_nontemporal_load`
+  streaming reads, UNROLL loads in flight, split-K (gridDim.y + fp32
+  atomicAdd), direct fp16 store when no split. Symmetric + asymmetric
+  (uint8 zeros) variants.
+- **Measured (cold L2)**: mlp gate/up 44.4us (596 GB/s!), down 44.9us
+  (589), qkv 36.7us (340), o_proj 36.9us (337) — vs the Triton GEMV's
+  136/143/81/76us. ~3x on the wide shapes; the wide ones now exceed the
+  512 GB/s DRAM spec (streaming loads avoid L2 pollution).
+- **Single layout** (`VLLM_RDNA2_W4_KPACK=1`, gfx10x default): weights
+  repacked at load into [K//8, N]; zeros unpacked to [K//G, N] uint8.
+  M=1 -> HIP GEMV; M>1 (spec verify, prefill) -> new Triton K-packed
+  GEMM (`w4a16_kpack_gemm`, interleave unpack along K, tl.dot).
+  The opaque dispatch op now carries an explicit `kpack` layout flag
+  (baked-out-shape-inference lesson from round 1: never infer layouts
+  from tensor shapes inside traced code).
+- **Bug found on the way**: the compressed-tensors zp is [N//8, K//G]
+  packed along dim-0; unpack-then-transpose is required (transpose-
+  then-unpack reads the wrong axis), and all nibble shifts need *4.
+  Caught by a new scheme-level roundtrip test
+  (tests/kernels/quantization/test_w4a16_scheme_roundtrip.py) which
+  builds a real compressed-tensors layer end-to-end — unit tests with
+  self-packed tensors missed it because they shared the same packing
+  assumption.
+- **Server**: 25.2 tok/s validated ("Paris." + warm runs stable),
+  +31% over the Triton GEMV path; round total 2.2 -> 25.2 = 11.5x.
+  Full RDNA2 suites 280/280.
+- int4 GEMV cost/step now ~5.3 ms (was ~18.8); remaining decode time is
+  dominated by fp16 projections (~12 ms incl. lm_head ~3 ms at 443
+  GB/s), allreduce 4.75 ms, GDN core 4 ms, attention + overhead.
+
 ## What's in the branch (25 commits)
 **Ported from the v0.23 fork (Phases 0–7):**
 - Platform detection (`on_gfx10x`), 6 HIP kernels (AWQ/GPTQ W4A16 GEMM, AWQ

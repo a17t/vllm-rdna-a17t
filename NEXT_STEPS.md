@@ -77,8 +77,15 @@ real Qwen3.8 TP2 dims (HK=8, HV=24, dk=dv=128, conv=4) multi-step.
 
 ## Item 4 (DONE, reference): current validated state
 
-- Base: origin/main + 46 commits (rebased 2026-08-18, `394c2d601b`).
+- Base: origin/main + rebased branch (2026-08-18) + round-6 kpack GEMV.
 - Build: `HIP_CLANG_PATH=/opt/rocm/lib/llvm/22/bin/ TORCH_ROCM_ARCH=gfx1030
   python setup.py develop` (venv: /mnt/Dev/vllm-rdna2/venv).
-- Serving: `serve_q38_27b.sh` = 19.2 tok/s validated (batch 1, short ctx).
+- Serving: `serve_q38_27b.sh` = **25.2 tok/s** validated (batch 1, short
+  ctx; VLLM_RDNA2_W4_KPACK=1 default-on: HIP K-packed W4A16 GEMV from
+  sebastianmechno-sys/vllm-rocm-windows-rdna2, ~3x the Triton GEMV on
+  wide shapes).
 - Backup branch: `main+rdna2-backup-pre-rebase` (pre-rebase state).
+- Remaining decode budget at 25.2 tok/s (~39.7 ms/step): fp16 projections
+  ~12 ms, int4 GEMVs ~5.3 ms, allreduce 4.75 ms, GDN ~4 ms, attn+overhead
+  remainder. Next perf levers: MTP correctness (Item 1, x1.7 potential),
+  one-shot AR (~3 ms), lm_head at 443 GB/s -> 596-class streaming GEMV.

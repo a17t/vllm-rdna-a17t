@@ -182,3 +182,72 @@ def test_rdna2_w4a16_gemv_m(M, N, K, gs):
     ref = x.float() @ w_deq.T
     torch.testing.assert_close(out.float(), ref, atol=2e-1, rtol=2e-2)
     assert out.isfinite().all()
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx10x()),
+    reason="Requires RDNA2 (gfx1030)",
+)
+@pytest.mark.parametrize(
+    "N,K,gs",
+    [(8704, 5120, 32), (5120, 8704, 32), (4096, 5120, 32),
+     (5120, 4096, 32), (1024, 2048, 64)],
+)
+def test_gemv_w4_kpack(N, K, gs):
+    """HIP K-packed M=1 GEMV vs chunked dequant reference."""
+    from vllm import _custom_ops as ops
+
+    def pack_k(t_nk):
+        t = t_nk.t().contiguous().to(torch.int32)
+        out = torch.zeros(K // 8, N, dtype=torch.int32, device=t.device)
+        for j in range(8):
+            out |= t[j::8] << (4 * j)
+        return out.contiguous()
+
+    torch.manual_seed(0)
+    w4 = torch.randint(0, 16, (N, K), dtype=torch.int32, device=DEVICE)
+    wq = pack_k(w4)
+    s = torch.rand(K // gs, N, dtype=torch.float16, device=DEVICE) * 0.01 + 0.005
+    z8 = torch.randint(0, 16, (K // gs, N), dtype=torch.uint8, device=DEVICE)
+    x = torch.randn(1, K, dtype=torch.float16, device=DEVICE) * 0.1
+
+    out = ops.gemv_w4_kpack(x, wq, s, z8, gs, 8)[0].float()
+
+    z_nk = z8.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    s_nk = s.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    ref = x[0].float() @ ((w4.float() - z_nk) * s_nk).T
+    torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
+    assert out.isfinite().all()
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_rocm() and on_gfx10x()),
+    reason="Requires RDNA2 (gfx1030)",
+)
+@pytest.mark.parametrize("M", [2, 3, 4, 33])
+@pytest.mark.parametrize("N,K,gs", [(8704, 5120, 32), (5120, 8704, 32)])
+def test_w4a16_kpack_gemm(M, N, K, gs):
+    """K-packed Triton GEMM (M>1) vs chunked dequant reference."""
+    from vllm.model_executor.layers.rdna2_gemm import w4a16_kpack_gemm
+
+    def pack_k(t_nk):
+        t = t_nk.t().contiguous().to(torch.int32)
+        out = torch.zeros(K // 8, N, dtype=torch.int32, device=t.device)
+        for j in range(8):
+            out |= t[j::8] << (4 * j)
+        return out.contiguous()
+
+    torch.manual_seed(0)
+    w4 = torch.randint(0, 16, (N, K), dtype=torch.int32, device=DEVICE)
+    wq = pack_k(w4)
+    s = torch.rand(K // gs, N, dtype=torch.float16, device=DEVICE) * 0.01 + 0.005
+    z8 = torch.randint(0, 16, (K // gs, N), dtype=torch.uint8, device=DEVICE)
+    x = torch.randn(M, K, dtype=torch.float16, device=DEVICE) * 0.1
+
+    out = w4a16_kpack_gemm(x, wq, s, z8, gs).float()
+
+    z_nk = z8.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    s_nk = s.t().to(torch.float32).repeat_interleave(gs, dim=1)
+    ref = x.float() @ ((w4.float() - z_nk) * s_nk).T
+    torch.testing.assert_close(out, ref, atol=3e-1, rtol=3e-2)
+    assert out.isfinite().all()

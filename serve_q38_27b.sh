@@ -1,15 +1,16 @@
 #!/bin/bash
 # Serve cyankiwi/Qwen3.8-27B-AWQ-INT4 on 2x Radeon PRO V620 (gfx1030) with
-# the current RDNA2 tree. Measured 2026-08-18: ~19.1 tok/s single-request
-# decode at short context (round-1: 2.2 -> 14.5 with the W4A16 GEMV;
-# round-2: +FP16_GEMV=1 and GEMV v2 dual-group tuning).
+# the current RDNA2 tree. Measured 2026-08-19: ~25.2 tok/s single-request
+# decode at short context (round-1: 2.2 -> 14.5 Triton W4A16 GEMV;
+# round-2: +FP16_GEMV=1 -> 19.1; round-6: HIP K-packed GEMV -> 25.2).
 #
 # Env notes:
 # - NATIVE_GDN / NATIVE_PAGED_ATTN stay off: the native GDN and paged-attn
 #   kernels still produce garbage after the first token on this checkpoint
 #   (open Phase-4 bug).
 # - NATIVE_AWQ has no effect on this checkpoint anymore: its gs=32 layers
-#   are auto-routed to the Triton W4A16 kernel + M=1 GEMV fast path.
+#   are auto-routed to the W4A16 path (HIP K-packed GEMV at M=1, default
+#   VLLM_RDNA2_W4_KPACK=1; Triton fallback with =0).
 # - FP16_GEMV=1: Triton GEMV for the unquantized GDN projections + lm_head
 #   (validated, +1.7 tok/s).
 # - MTP speculative decoding is NOT enabled: acceptance is healthy (~1.9 at
