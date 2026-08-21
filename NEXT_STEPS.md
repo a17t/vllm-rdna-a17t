@@ -106,6 +106,98 @@ executor/multiproc_executor.py`). Use `rocprofv3-attach <pid>` against an
 already-running vllm worker process next round; that path was not exercised
 in this session.
 
+### 4B cross-check (2026-08-21): MTP works correctly AND fast on Qwen3.5-4B-AWQ
+
+To separate model-scale vs MTP-pipeline effects, ran the same probe matrix
+on `QuantTrio/Qwen3.5-4B-AWQ` (4B params, TP1, single V620 card, fp16 AWQ,
+native MTP weights bundled). Uses the **`qwen3_5_mtp`** speculative path
+(different drafter code from Qwen3-Next's `qwen3_next_mtp`).
+
+| Label | Config | tok/s | sec / step* |
+|---|---|---:|---:|
+| nospec_4b | no MTP, cudagraph | 7.98 | 125 ms |
+| mtp_k2_4b | MTP k=2, cudagraph | **53.30** | **19 ms** |
+| mtp_k1_4b | MTP k=1, cudagraph | 44.64 | 22 ms |
+| eager_4b_k2 | MTP k=2, NO cudagraph | 46.85 | 21 ms |
+
+\* sec/step = wall per output token. Cards 0 only, TP1.
+
+**Critical observations**:
+1. **MTP k=2 is 6.7× faster than nospec on 4B** (53.3 vs 8.0 tok/s). On the
+   27B TP2 setup, MTP was 6.4× slower than nospec. **The MTP pipeline is
+   not the source of the 27B regression** — when the model fits and TP=1,
+   MTP *exceeds* the non-spec throughput via speculative acceptance. The
+   27B TP2 bottleneck must be in something that's specific to TP>1 + 27B
+   (i.e., NCCL allreduce, mamba-cache pressure, or graph-pad mismatch on
+   the large capture-size table).
+2. **k=1 vs k=2 on 4B**: k=1 (44.6 tok/s) is *slower* than k=2 (53.3),
+   mirroring the 27B pattern (k=1=2.24, k=2=3.17). The fixed-overhead-per-
+   iteration hypothesis **survives** but it's a *small absolute* overhead
+   at 4B (~1-2 ms/step on a 19 ms total step). Per-iter cost on 4B:
+   80/44.6 = 1.79 iter × tok; 80/53.3 = 1.50 iter × tok. With acceptance
+   ~2.5 for k=2 and ~1.4 for k=1, per-iter cost ~12-13 ms regardless of k.
+   That's the **fixed-overhead signature** — but at 4B it's a small
+   fraction of the total step (12/19 = 63%), where at 27B TP2 it was
+   overwhelming (~600/870 = 69% but on a 870 ms step).
+3. **eager is 12% slower than cudagraph at 4B** (46.85 vs 53.30 tok/s).
+   On 27B TP2, eager matched cudagraph (3.10 vs 3.17). This is consistent
+   with: at 27B TP2 the cudagraph is bottlenecked by something else (so
+   graph doesn't help); at 4B TP1 cudagraph is healthy (so graph helps by
+   12% as expected).
+4. **nospec 4B is suspiciously slow** (7.98 tok/s on a 4B AWQ model that
+   should be ~80 tok/s on V620). Likely cause: shared-memory autotune
+   failures during the 13-min startup ("Autotuning failed with out of
+   resource: shared memory, Required: 73728, Hardware limit: 65536")
+   left some kernels in a degraded autotune config. MTP runs after the
+   same warmup finished and shows 53 tok/s, so the warmup completes in
+   time for the decode — but the **first** decode (nospec) may have paid
+   a JIT-compile cost on a kernel the second run didn't. **The nospec
+   baseline on 4B is unreliable**; treat the MTP numbers as the headline.
+
+### Cross-implication for the 27B TP2 regression
+
+The 600 ms fixed per-iter overhead at 27B TP2 is **NOT present** at 4B
+TP1 (where MTP is faster than nospec). The cause must therefore lie in
+something that scales with model size or TP>1:
+- **NCCL allreduce** (H6): 27B TP2 has ~128 NCCL calls × 37 us = 4.75 ms,
+  but at TP1 there are zero. Inconsistent with the 600 ms magnitude.
+- **CUDAGraph capture-size mismatch** (H8): at 4B TP1 the cudagraph
+  memory is 2.58 GiB (vs 11.14 GiB at 27B TP2) and the largest capture
+  size is 256 (vs 1024). The graph is much less padded and works fine.
+  At 27B TP2, max_num_seqs=64 vs graph capture-size up to 1024 = **16×
+  padding**. This is the most plausible remaining cause.
+- **mamba-cache allocation pressure**: at 4B TP1 we got the full 71+
+  blocks; at 27B TP2 we were capped at 71 blocks. Same constraint,
+  similar pressure on both setups, but the **graph** allocation may be
+  what interacts with it differently.
+
+### Why rocprofv3 again failed this round
+
+`ROCPROF=1 ./mtp_throughput_probe.sh` on the 4B single-process EngineCore
+**still hangs the vllm startup** (server log shows only `rocprofv3 tool
+initialization`, no further output). The issue is reproducible on TP1
+with no Worker_TP forks — so the prior hypothesis (multiprocess
+conflict) is **not** the cause. Suspected: the rocprofv3 launch wrapper
+calls `libtorch_compiler_register_attach` or similar initialization
+that doesn't terminate cleanly when the torch HIP backend is initialized
+inside the same process.
+
+`rocprofv3 --pid <ENGINE_PID>` (attach mode) failed differently: it
+attempts to dlopen `librocprofiler-register.so`, which is **not shipped
+in this ROCm 7.2 install** (replaced by `librocprofiler-sdk-attach.so`,
+a different mechanism using `rocprofiler_attach_set_api_table`).
+Stubbing the missing library (`rocprofiler_register_attach` → return 0)
+gets past the dlopen but the attach still fails because the real attach
+mechanism uses the modern api_table path, not the legacy `register_attach`.
+
+**Recommendation for next session**: file a ROCm bug against this
+install (missing `librocprofiler-register.so` + missing
+`librocprofiler-register.so.1`) and retry once a corrected ROCm 7.2
+package lands. In the meantime, the CPU-side torch.profiler (already
+captured) is the only kernel-level signal we have; its limitation
+(opaque cudagraph replay) can be worked around with `--enforce-eager`
+when MTP correctness is fully validated on the small model.
+
 MTP stays OFF in `serve_q38_27b.sh` until this lands.
 
 ### Root-cause bracket (all evidence from this branch)
