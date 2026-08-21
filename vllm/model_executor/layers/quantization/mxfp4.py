@@ -469,6 +469,27 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
+def _use_k3_situ_aiter(moe: FusedMoEConfig) -> bool:
+    """Whether Kimi-K3's SiTU MXFP4 MoE should use the AITER A16W4 kernel.
+
+    K3 is weight-only MXFP4 (W4A16) with SiTU activation, which the generic
+    MXFP4 backend selector does not cover; route it to AITER on gfx950.
+    """
+    if not current_platform.is_rocm():
+        return False
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.platforms.rocm import on_gfx950
+
+    return (
+        rocm_aiter_ops.is_fused_moe_enabled()
+        and on_gfx950()
+        and moe.activation == MoEActivation.SITU
+        and moe.activation_situ_linear_beta is not None
+        and rocm_aiter_ops.get_aiter_activation_type("situ") is not None
+    )
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     """MXFP4 MoE quantization method."""
 
