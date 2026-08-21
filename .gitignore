@@ -256,6 +256,7 @@ vllm/grpc/vllm_engine_pb2.pyi
 mtp_throughput_probe.sh
 mtp_rocprof_attach.sh
 serve_q36_35b.sh
+serve_q38_27b-gptq.sh
 bench_08b.py
 bench_08b_profile.py
 counters.txt
