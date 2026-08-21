@@ -252,5 +252,14 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
+# RDNA2 fork — diagnostic harness + trace artifacts (untracked locally)
+mtp_throughput_probe.sh
+serve_q36_35b.sh
+bench_08b.py
+bench_08b_profile.py
+counters.txt
+run_single.py
+traces/
+
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h

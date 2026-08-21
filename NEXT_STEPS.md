@@ -20,25 +20,93 @@ clone per call and NOT transpose.
 **Validated**: primes byte-correct ("2, 3, 5, 7, 11, 13, 17, 19, 23..."),
 coherent rivers think-text, acceptance 2.8, non-spec control 25.16 tok/s.
 
-## Item 1b (NEW, ACTIVE): MTP throughput regression — correct-but-slow
+## Item 1b (NEW, ACTIVE 2026-08-21): MTP throughput regression — diagnostic
 
-Correct MTP runs at 2.5 tok/s (~1.1 s/step) vs corrupted-but-fast 25 tok/s
-(81 ms/step) pre-fix. Evidence gathered:
-- py-spy: 86% of worker time blocked in
-  `num_accepted_tokens_event.synchronize()` (gpu_model_runner.py:2177)
-  + `torch.accelerator.synchronize` (:1219) — GPU queue is the long pole
-- GPU shows 99% busy (amd-smi) — possibly NCCL spin (TORCH_NCCL_BLOCKING_WAIT=1
-  from our rocm.py workaround) rather than real work
-- BOTH the reference Triton conv and the anchored native conv are equally
-  slow -> NOT kernel cost; slowdown correlates with CORRECT spec semantics
-  (acceptance 2.8 vs 2.1), i.e. something downstream of correct anchoring
-- conv kernel itself: 4.2us/call captured, 76us eager — exonerated
-- non-spec control on same build: 25.16 tok/s — exonerated globally
-Next: profile the GPU queue composition during a step (rocprof attach or
-in-server event timing around drafter proposal); check whether the draft
-forward's eager NCCL collectives serialize with the graph replays; test
-with TORCH_NCCL_BLOCKING_WAIT unset; consider capping mamba spec blocks.
-MTP stays OFF in serve_q38_27b.sh until this lands.
+Correct MTP runs at **3.17 tok/s** (k=2, ~316 ms/tok) vs **20.4 tok/s** nospec
+on the same cards 0,1 build (correctness fix `a97bc98864` retained, acceptance
+~2.8, byte-exact primes prompt). The pre-fix corrupted run was 25 tok/s but
+output garbage; non-spec on cards 2,3 is 25.2 tok/s.
+
+### Diagnostic probe results (2026-08-21, single-prompt greedy, 80 tok, cards 0,1)
+
+| Label | Config | tok/s | sec / step* |
+|---|---|---:|---:|
+| nospec_control | no MTP, cudagraph | 20.38 | 49 ms |
+| baseline | MTP k=2, cudagraph | 3.17 | 316 ms |
+| profile_h2_v2 | MTP k=2 + torch.profiler | 3.22 | 311 ms |
+| enforce_eager | MTP k=2, NO cudagraph | 3.10 | 323 ms |
+| mtp_k1 | MTP **k=1**, cudagraph | 2.24 | 446 ms |
+
+\* sec/step = wall per output token.
+
+**Key observations**:
+1. **k=1 is SLOWER than k=2** (2.24 vs 3.17 tok/s). Per-iter cost: ~673 ms (k=1)
+   vs ~883 ms (k=2). The bottleneck is dominated by a **fixed per-step overhead
+   of ~600 ms** that does NOT scale with k. Pure verify forward on (k+1) tokens
+   would only be (k+1) × 49 ms = 147 ms (k=2) or 98 ms (k=1), so the verify
+   forward is being inflated ~6× at k=1 and ~6× at k=2. The fixed overhead is
+   the suspect.
+2. **cudagraph vs eager are equivalent** (3.10 vs 3.17 tok/s). H4 (graph
+   padding mismatch) REFUTED. The bottleneck is NOT in graph mechanics.
+3. **nospec on cards 0,1 = 20.4 tok/s** (vs 25.2 on cards 2,3). The
+   ~20% gap is hardware variance (low-power state). Kernels healthy.
+
+### Hypotheses REFUTED in this round
+
+- **H1 (async scheduling + mamba_cache_mode interaction)**: refuted by code
+  reading. The CPU sync at `gpu_model_runner.py:2176` is taken regardless of
+  `async_scheduling` when `mamba_cache_mode='align'` (which is auto-set for
+  Qwen3.5 hybrid per `vllm/config/interface.py:605`). Tested by code reading
+  rather than experiment; the sync itself is ~0 cost in either mode once
+  control reaches the next launch. mamba_cache_mode='align' was already on
+  (server log: "Mamba cache mode is set to 'align' for Qwen3_5ForConditional
+  Generation by default when prefix caching is enabled"), eliminating H5.
+- **H4 (CUDAGraph padding forces oversized launch)**: refuted empirically by
+  `--enforce-eager` giving the same 3.10 tok/s as 3.17 with graph.
+- **H6 (NCCL spin)**: NCCL kernel time in the torch.profiler trace was
+  ~3.9 ms × 84 calls = 327 ms across 27 iters = 12 ms/iter; far below the
+  600 ms of unexplained overhead. Not the cause.
+
+### Hypotheses remaining (next round's investigation)
+
+- **H7 (verify pass not graph-captured)**: with `dynamic_shapes_config.type=backed`,
+  the verify forward shape (1 req × (k+1) tokens) may fall through to eager
+  mode while the postprocess + state copy uses the graph. Each iter would
+  then pay ~3-4 eager forward costs (no graph launch amortization).
+- **H8 (CUDAGraph capture-size mismatch on hybrid)**: with multi-KV-group
+  models and cudagraph padding, the captured graph may be sized for max_num_seqs
+  but launch with k+1 token positions — the kernel grid launches on a
+  shrunken shape but reads padded metadata (KV cache scatter, slot mapping).
+- **H9 (per-iter proposer overhead in `Step3p5MTPProposer`)**: the drafter
+  rebuilds per-group block tables + slot mappings on every propose call
+  (`step3p5.py:102-120`). With k=2 that's 2 drafter forwards ×
+  ~100 us metadata = ~200 us/iter — small in isolation but possibly coupled
+  to graph capture ranges.
+
+### Method that worked (reusable harness)
+
+- `mtp_throughput_probe.sh` — single-command harness at repo root:
+  launches an MTP server on cards 0,1, waits for ready, runs a warmup
+  + 80-tok greedy request, captures rocprof/torch.profiler, prints result.
+  See `PROFILE=1 ./mtp_throughput_probe.sh <label>` for torch.profiler and
+  `ROCPROF=1 ./mtp_throughth_probe.sh <label>` for rocprofv3.
+- Probe results for this round: `/tmp/opencode/mtp_probe/{baseline,
+  enforce_eager, profile_h2_v2, mtp_k1, nospec_control}/client.log`.
+- Trace outputs: `traces/profiler_h2_v2_out_{0,1}.txt` (CPU-side only,
+  GPU events opaque to torch.profiler under cudagraph).
+
+### Why rocprofv3 in this round did not work
+
+`ROCPROF=1 ./mtp_throughput_probe.sh rocprof_h6_v2` started rocprofv3
+wrapper but the vllm child never produced output past the initial
+deprecation warning. After 20 minutes the harness timed out and rocprof
+output dir was empty. Likely cause: rocprofv3's runtime instrumentation
+hooks conflict with vLLM's multiprocessing TP worker spawn (`vllm/v1/
+executor/multiproc_executor.py`). Use `rocprofv3-attach <pid>` against an
+already-running vllm worker process next round; that path was not exercised
+in this session.
+
+MTP stays OFF in `serve_q38_27b.sh` until this lands.
 
 ### Root-cause bracket (all evidence from this branch)
 
