@@ -200,6 +200,68 @@ when MTP correctness is fully validated on the small model.
 
 MTP stays OFF in `serve_q38_27b.sh` until this lands.
 
+### vllm-rdna2-recipe incorporation (2026-08-21, later): fd kernel landed, MTP regression NOT attention
+
+Incorporated leapdragon/vllm-rdna2-recipe (same V620/gfx1030 hardware, same
+Qwen3.8-27B arch; GPL-3.0+, vendored under `plugins/` + `verify/` with
+`NOTICE-GPL.md` — never upstream those dirs):
+
+1. **0003 port** (our own Apache code, `triton_attn.py`): scale
+   `num_par_softmax_segments` on gfx10x so single-seq decode reaches
+   MIN_LAUNCH_GRID_SIZE_2D, cap 64. Recipe measured 1.6x at 41k.
+2. **`fd_decode` kernel** (in-tree Apache,
+   `vllm/model_executor/layers/attention/rdna2_fd_decode.py`): int8
+   flash-decode for OUR layout (split K/V views + dedicated f32 scale
+   caches; not the recipe's combined buffer). Byte-stripe dots via int32
+   views, graph-safe (grid sized by max_ctx, seq read on device).
+   **Unit-proven 4/4** (`tests/kernels/test_fd_decode_rdna2.py`, max abs
+   diff ~1e-4 vs pure-torch reference). q==1 only; the batched multi-query
+   (MTP verify) port is deferred — reference kept at
+   `plugins/fd_rdna2/fd_rdna2/fd_kernel2.py`.
+3. **fd_rdna2 plugin** (GPL, adapted): gates q==1 + INT8_PER_TOKEN_HEAD +
+   hs256 -> our kernel; all else -> stock. Requires
+   `--kv-cache-dtype int8_per_token_head`.
+
+**Results (AWQ-INT4, TP2, cards 0,1, MAXSEQS=8, primes byte-correct all):**
+
+| Config | KV | fd | tok/s (80-tok probe) |
+|---|---|---|---:|
+| nospec | fp16 | - | 20.25 |
+| nospec | int8 | no | 22.64 |
+| nospec | int8 | yes | 22.15 |
+| MTP k=2 | fp16 | - | 3.17 |
+| MTP k=2 | int8 | no | 3.21 |
+| MTP k=2 | int8 | yes | 3.21 |
+
+Honest decode-only rates (recipe's `verify/decode-rate.py`, excludes
+prefill, MAX_LEN 12288): int8+fd **30.6 t/s @3.7k / 29.9 @7.1k**; int8
+no-fd **30.9 / 30.1** — **fd is perf-neutral on top of the 0003 patch at
+<=8k ctx** (patched stock already fills the GPU; recipe's fd win was
+against their UNPATCHED stock at 41k).
+
+**Conclusions**:
+- int8 KV: +12% nospec. Correct on AWQ (primes byte-exact).
+- The MTP ~10x regression is **NOT attention slope** (nospec decode at 7k
+  ctx is still ~30 t/s; attention cannot cost ~670 ms/step). Also NOT KV
+  dtype, NOT fd routing, NOT graph-vs-eager (3.10 vs 3.17), NOT MAXSEQS
+  padding (8 == 64). The per-step overhead lives in our tree's MTP pipeline
+  itself. The recipe runs the same MTP head on vLLM **0.27.1** as a WIN
+  (+24% @41k) -> **next step: compare against 0.27.1** (side-by-side build
+  or rebase) before more micro-investigation on 0.26.1rc1-dev.
+- GPTQ on our tree is BROKEN (user test: btbtyler09/Qwen3.8-27B-GPTQ-4bit
+  returns exclamation-mark garbage, stock serve config, fp16 KV). GPTQ W4
+  dispatch needs validation before the recipe's GPTQ numbers can be
+  reproduced; park it.
+
+**Measurement pitfalls learned**:
+- The 80-tok probe's `tok/s` INCLUDES prefill — meaningless for context
+  slopes. Use `verify/decode-rate.py` (streams, times first->last delta).
+- Concurrent GPU work on the shared host contaminates results (one MTP+fd
+  run measured 1.63 t/s while cards 2,3 ran GPTQ tests; identical re-run
+  gave 3.21). Re-run outliers before believing them.
+- PROFILE=1 does NOT force eager (graphs still captured; profiler pauses
+  during capture).
+
 ### Root-cause bracket (all evidence from this branch)
 
 - ngram speculative = **byte-exact** vs non-spec greedy -> verify/sampler/
