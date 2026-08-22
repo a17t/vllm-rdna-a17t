@@ -262,6 +262,49 @@ against their UNPATCHED stock at 41k).
 - PROFILE=1 does NOT force eager (graphs still captured; profiler pauses
   during capture).
 
+## v0.27.1 merge + "lost gains" incident (2026-08-22): RESOLVED, gains intact
+
+Merged tag v0.27.1 (`a500c4f60e`). The merge was a near-no-op: our base was
+already past v0.27.1 content (the 0.26.1rc1 string was versioneer's nearest
+tag); the entire merge delta is +21 lines in mxfp4.py (Kimi-K3 helper,
+unreachable for Qwen/ROCm). Post-merge: unit tests 30/30, MTP byte-correct
+at the same 3.2 t/s.
+
+**The "nospec < 2 t/s, gains lost" report was fully environmental** — three
+stacked causes, verified on the idle host:
+1. **GPU contention**: serve_q38_27b.sh sets no HIP_VISIBLE_DEVICES, so it
+   binds to cards 0,1 — the same cards every probe server used during that
+   window. Proven 2x+ penalty from sharing (1.63 vs 3.21 t/s identical
+   config).
+2. **Cold compile cache** for the prod config hash (probe configs have
+   different hashes): ~17 min first start.
+3. **First-request JIT** at a fresh shape (user's own observation; now
+   baked into the probe as a shape-matched WARMUP2 run, reported
+   separately).
+
+**Verified recovery on idle host, merged tree, prod-shaped config**
+(fp16 KV, 262144 ctx, util 0.98, FULL_AND_PIECEWISE):
+- 80-tok probe: WARMUP2 20.2 / RESULT 23.5 t/s, primes byte-correct.
+- Honest decode rates (verify/decode-rate.py): **24.0 t/s @3.2k, 23.0 @3.6k,
+  16.4 @7.5k** — at/above the 25.2-era baseline band (which was measured at
+  short context). Same after a restart (22.8/22.1).
+
+**Restart cost anatomy** (prod config, warm compile cache):
+- torch.compile: ~1 s (cache hit).
+- **PIECEWISE CUDA-graph capture: 434 s (~7.2 min), 51 shapes, 6.42 GiB —
+  paid on EVERY restart** (graph capture is never cached). This is the
+  "startup takes ages" pain, not compilation. FULL_DECODE_ONLY (recipe's
+  choice) captures far fewer shapes (~1 min class) and is worth a validated
+  trial as a future item; do NOT switch while chasing other regressions.
+
+**Standing measurement protocol** (from here on):
+- Exclusive GPU windows: measurements on cards 0,1 only while 2,3 idle
+  (and vice versa); serve_q38_27b.sh should pin HIP_VISIBLE_DEVICES
+  explicitly when run alongside probes.
+- Warm up with 2-3 shape-matched throwaway requests before judging speed.
+- Compile cache: keep warm; purge ONLY when traced code changes.
+
+
 ### Root-cause bracket (all evidence from this branch)
 
 - ngram speculative = **byte-exact** vs non-spec greedy -> verify/sampler/

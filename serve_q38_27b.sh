@@ -26,6 +26,10 @@ export VLLM_RDNA2_NATIVE_AWQ=1
 export VLLM_RDNA2_FP16_GEMV=1
 export VLLM_RDNA2_NATIVE_PAGED_ATTN=0
 export VLLM_ENGINE_READY_TIMEOUT_S=1200
+# Pin to a fixed card pair so this server never lands on the same cards as
+# benchmark probes (cards 0,1 in our setup are the probe pair). Override by
+# exporting HIP_VISIBLE_DEVICES before this script.
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-2,3}"
 exec /mnt/Dev/vllm-rdna2/venv/bin/vllm serve cyankiwi/Qwen3.8-27B-AWQ-INT4 \
     --dtype float16 \
     --kv-cache-dtype float16 \
@@ -35,5 +39,4 @@ exec /mnt/Dev/vllm-rdna2/venv/bin/vllm serve cyankiwi/Qwen3.8-27B-AWQ-INT4 \
     --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
-    --gpu-memory-utilization 0.98 \
-    -dp 2
+    --gpu-memory-utilization 0.98 
