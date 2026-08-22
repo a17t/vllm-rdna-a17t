@@ -610,7 +610,8 @@ def _w4a16_kpack_gemm_kernel(
         else:
             deq = (w.to(tl.float32) - ZP_BIAS) * s
 
-        acc += tl.dot(a.to(deq.dtype), deq, out_dtype=tl.float32)
+        acc += tl.dot(a.to(tl.float16), deq.to(tl.float16),
+                      out_dtype=tl.float32)
 
     tl.store(
         c_ptr + offs_m[:, None] * N + offs_n[None, :],
