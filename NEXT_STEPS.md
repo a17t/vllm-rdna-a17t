@@ -1,4 +1,41 @@
-# NEXT STEPS — parked work items (updated 2026-08-20)
+# NEXT STEPS — parked work items (updated 2026-08-22)
+
+## Item 5 (DONE 2026-08-22): recipe REPLICATED on GPTQ — MTP shipping
+
+`serve_q38_27b_gptq.sh` = the full vllm-rdna2-recipe config on our fork
+(btbtyler09/Qwen3.8-27B-GPTQ-4bit). Results (idle host, verify/decode-rate.py):
+
+| ctx | fp16 AWQ old stack | GPTQ bundle MTP=0 | GPTQ bundle MTP=2 | recipe MTP=2 |
+|---|---:|---:|---:|---:|
+| ~3.5k | 25.7 | 34.7 | **41.3** | 43-51 |
+| ~11-14k | 14.2 | 34.1 | **36.6** | 50.4 |
+| ~37-41k | 6.3 | 29.9 | **28.5** | 41.4 |
+
+- **MTP k=2 is greedy-lossless (8/8)** via the checkpoint's own head
+  (qwen3_5_mtp), acceptance 2.2 mean / 61% draft (recipe: 58%).
+- Root cause of our earlier GPTQ garbage: our fork's RDNA2 W4 kernels
+  auto-winning dispatch for GPTQ. Fix = `--linear-backend exllama`
+  (Exllama was compiled+HIP-ready all along; the recipe's
+  VLLM_DISABLED_KERNELS list is a no-op on our tree — it names kernels
+  that are already auto-rejected here).
+- Recipe patch 0004 (BLOCK_KN_SIZE 256): +4.5% measured.
+- fd_rdna2 mq kernel (batched q<=4 verify, one KV pass): numeric 1e-4 vs
+  reference; without it MTP regressed at long ctx exactly as the recipe
+  warned (26.2 vs 28.5 @37k).
+- FULL_DECODE_ONLY: graph capture 13 s vs 434 s (FULL_AND_PIECEWISE at
+  131k ctx) — fixes the slow-restart pain too.
+
+**Remaining gaps to recipe (parked)**:
+1. **MTP + prefix caching anomaly**: with MTP=2, TTFT at long ctx implies
+   FULL re-prefill every request (147 s @37k; MTP=0 same harness: 2.5 s).
+   Prefix cache appears ineffective under spec decode on hybrid models —
+   worth its own investigation (mamba-align block boundaries + spec?).
+2. Mid/long-ctx gap (36.6 vs 50.4 @14k; 28.5 vs 41.4 @41k): candidates =
+   TunableOp tuned-CSV (we run untuned), their torch 2.11 gfx1030 build,
+   PCIe slot width (recipe insists two x16-rooted cards; our pair 0,1 may
+   be x8 — halves P2P for allreduce). Measure in-server comms first.
+3. AR_RDNA2 allreduce plugin: vendored+installable, still unvalidated
+   (needs the 8/8 greedy gate before enabling in production).
 
 ## Item 1 (DONE 2026-08-20): MTP correctness — ROOT CAUSE FOUND & FIXED
 
