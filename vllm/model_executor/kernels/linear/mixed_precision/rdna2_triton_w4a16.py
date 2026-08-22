@@ -52,7 +52,7 @@ def _rdna2_w4a16_linear_impl(
     would be baked out of the traced graph).
     """
     if kpack:
-        # K-packed [K//8, N] layout (HIP gemv_w4_kpack path)
+        # K-packed [K//8, N] int32 layout (HIP gemv_w4_kpack path)
         if x.shape[0] == 1 and group_size in (32, 64, 128, 256):
             from vllm import _custom_ops as ops
 
@@ -63,7 +63,22 @@ def _rdna2_w4a16_linear_impl(
             if bias is not None:
                 out = out + bias
             return out
-        # M > 1 on K-packed: unpack via indexed shifts (each int32 re-read
+        if (
+            1 < x.shape[0] <= 4
+            and group_size in (32, 64, 128, 256)
+        ):
+            # Spec-decode verify batches (MTP k<=3 -> M=3): dedicated
+            # broadcast+sum GEMV on the kpack layout. The generic tl.dot
+            # GEMM below is 15-17x slower at these M (fp32 dot -> scalar
+            # FMA on gfx1030, BLOCK_M=64 mostly padding).
+            from vllm.model_executor.layers.rdna2_gemm import (
+                rdna2_w4a16_kpack_gemv_m,
+            )
+
+            return rdna2_w4a16_kpack_gemv_m(
+                x, w_q, w_s, w_zp, group_size, zp_bias, bias
+            )
+        # M > 4 on K-packed: unpack via indexed shifts (each int32 re-read
         # 8x from cache) into the Triton kernel's N-packed expectation is
         # not free — instead compute via the transposed GEMM form on the
         # packed rows.

@@ -658,3 +658,143 @@ def w4a16_kpack_gemm(
     if bias is not None:
         y = y + bias
     return y
+
+
+@triton.jit
+def _w4a16_kpack_gemv_m_kernel(
+    x_ptr,  # [M, K] fp16/bf16 activations (M small, <= BLOCK_M <= 4)
+    w_ptr,  # [K//8, N] int32, K-packed (gemv_w4_kpack layout)
+    s_ptr,  # [K//GROUP, N] scales
+    z_ptr,  # [K//GROUP, N] uint8 zeros if HAS_ZP (kpack layout)
+    b_ptr,  # [N] bias if HAS_BIAS
+    y_ptr,  # [M, N] output
+    N,
+    K,
+    M,
+    HAS_ZP: tl.constexpr,
+    ZP_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # multiple of 8
+    BLOCK_M: tl.constexpr,  # padded M (power of 2 >= actual M)
+):
+    """y = x @ dequant(W).T + bias for a few rows (1 < M <= 4) on the
+    K-packed layout.
+
+    Spec-decode verify batches (MTP k<=3 -> M=3) hit this path. Weight
+    rows are BLOCK_N consecutive int32 — fully coalesced. Unpack mirrors
+    the N-packed small-M GEMV: 3 tl.interleave rounds replicate each
+    int32 8x along K, then a per-k%8 shift-select; accumulation is
+    broadcast+sum FMA (gfx1030 has no fp32 dot units and M<=4 amortises
+    nothing). One x load and one scale gather per K-tile.
+    """
+    pid = tl.program_id(0)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_k8 = tl.arange(0, BLOCK_K // 8)
+    BK8: tl.constexpr = BLOCK_K // 8
+    n_mask = offs_n < N
+    m_mask = offs_m < M
+
+    # k%8 nibble shifts tiled across BLOCK_K: [BK8, 8] -> [BLOCK_K]
+    shifts_row = tl.arange(0, 8) * 4
+    shifts_2d = tl.broadcast_to(shifts_row[None, :], (BK8, 8))
+    shifts_k = tl.reshape(shifts_2d, (BLOCK_K,))
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        ks = k0 + offs_k
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + ks[None, :],
+            mask=m_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)  # [BLOCK_M, BLOCK_K]
+
+        wp = tl.load(
+            w_ptr + (k0 // 8 + offs_k8)[:, None] * N + offs_n[None, :],
+            mask=n_mask[None, :],
+            other=0,
+        )  # [BK8, BLOCK_N] int32, coalesced
+        # Unpack to [BLOCK_K, BLOCK_N]: interleave works on the last axis,
+        # so transpose to [BLOCK_N, BK8], replicate each packed row 8x
+        # along K (nibbles j=0..7 of row r -> k = r*8+j), shift-select,
+        # transpose back (same scheme as _w4a16_kpack_gemm_kernel).
+        wt = tl.trans(wp)  # [BLOCK_N, BK8]
+        wt = tl.interleave(wt, wt)
+        wt = tl.interleave(wt, wt)
+        wt = tl.interleave(wt, wt)  # [BLOCK_N, BLOCK_K]
+        wt = (wt >> shifts_k[None, :]) & 0xF
+        w = tl.trans(wt).to(tl.float32)  # [BLOCK_K, BLOCK_N]
+
+        g = ks // GROUP
+        s = tl.load(
+            s_ptr + g[:, None] * N + offs_n[None, :],
+            mask=n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)  # [BLOCK_K, BLOCK_N] k-major (coalesced rows)
+        if HAS_ZP:
+            z = tl.load(
+                z_ptr + g[:, None] * N + offs_n[None, :],
+                mask=n_mask[None, :],
+                other=0,
+            ).to(tl.float32)
+            deq = (w - z) * s
+        else:
+            deq = (w - ZP_BIAS) * s
+
+        acc += tl.sum(x[:, :, None] * deq[None, :, :], axis=1)
+
+    if HAS_BIAS:
+        acc += tl.load(b_ptr + offs_n, mask=n_mask, other=0.0).to(
+            tl.float32
+        )[None, :]
+    tl.store(
+        y_ptr + offs_m[:, None] * N + offs_n[None, :],
+        acc.to(y_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def rdna2_w4a16_kpack_gemv_m(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    scales: torch.Tensor,
+    zeros_u8: torch.Tensor | None,
+    group_size: int,
+    zp_bias: float = 8.0,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Small-M (<= 4) W4A16 GEMV on the K-packed layout ([K//8, N] int32).
+
+    The fast path for spec-decode verification batches when kpack weights
+    are enabled; replaces the tl.dot GEMM fallback that ran at ~0 GB/s
+    effective for M <= 4 (see NEXT_STEPS Item 6).
+    """
+    M, K = x.shape
+    N = w_q.shape[1]
+    assert w_q.shape[0] == K // 8
+    block_m = max(2, triton.next_power_of_2(M))
+    y = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    _w4a16_kpack_gemv_m_kernel[(triton.cdiv(N, 64),)](
+        x,
+        w_q,
+        scales,
+        zeros_u8 if zeros_u8 is not None else scales,
+        bias if bias is not None else x.reshape(-1)[:1],
+        y,
+        N,
+        K,
+        M,
+        HAS_ZP=zeros_u8 is not None,
+        ZP_BIAS=zp_bias,
+        HAS_BIAS=bias is not None,
+        GROUP=group_size,
+        BLOCK_N=64,
+        BLOCK_K=64,
+        BLOCK_M=block_m,
+        num_warps=4,
+        num_stages=2,
+    )
+    return y
