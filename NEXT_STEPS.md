@@ -1,61 +1,34 @@
 # NEXT STEPS — parked work items (updated 2026-08-22)
 
-## Item 6 (DONE 2026-08-22, DIAGNOSE-ONLY): AWQ+MTP root cause = kpack GEMM at M>1
+## Item 6 (FIXED 2026-08-22): AWQ+MTP root cause = kpack GEMM at M>1 — LANDED
 
-The entire 10x AWQ MTP regression (2.9-3.2 t/s) is the **Triton
-`w4a16_kpack_gemm` kernel used for M>1 calls**. Clean A/B on the identical
-bundle (only VLLM_RDNA2_W4_KPACK differs, 5 warm runs each):
+**Fix shipped** (two commits): `rdna2_w4a16_kpack_gemv_m` (new Triton
+small-M GEMV on the kpack layout, broadcast+sum FMA, coalesced int32
+loads; dispatch 1<M<=4 -> it) + fp16 dot in the kpack GEMM (2.3-2.6x
+prefill). Results, AWQ bundle + kpack=1 + MTP k=2 (cards 0,1, idle):
 
-| AWQ + bundle + MTP k=2 | short-prompt tok/s |
-|---|---:|
-| kpack=1 (default) | 2.9-3.2 |
-| kpack=0 | **32.0** |
+| measurement | before | after |
+|---|---:|---:|
+| M=3 kernel (27B shapes) | 1452-2953 us | 136-236 us |
+| 80-tok probe (incl prefill) | 2.9-3.2 t/s | **27.0** |
+| decode-only (streamed) | — | **31.8** |
+| greedy vs MTP=0 baseline | — | **8/8 identical** |
+| MTP=0 short probe (M=1 path) | 22.15-22.64 | 22.89 (unchanged) |
+| 41k-ctx request | engine death | survives (18.8 t/s decode) |
 
-**Mechanism** (rdna2_triton_w4a16.py:54-72): with kpack ON,
-- M=1 (plain decode) -> HIP `gemv_w4_kpack` op: fast (~85 us/layer, 580 GB/s).
-- M>1 (spec verify M=3, and any small batch) -> `_kpack_gemv_batched` ->
-  Triton `w4a16_kpack_gemm`: **NEVER benchmarked at small M** (kpack round-6
-  was validated at M=1 only).
-- kpack=0: M<=4 -> `rdna2_w4a16_gemv_m` (fast at M=3).
+`VLLM_RDNA2_W4_KPACK=0` is **no longer needed** for MTP. Nuance: kpack=0
+(npack gemv_m) is still ~10-15% faster for MTP-heavy decode (its M=3
+kernel is 1.4x faster than the new kpack one), while kpack=1 keeps the
+faster M=1 HIP op and one layout. Not worth further tuning now.
 
-Microbench (real 27B shapes, KxN in {5120x5120, 9216x5120, 5120x9216},
-gs=32, cards 0):
-
-| kernel | M=1 | M=3 | M=4 |
-|---|---:|---:|---:|
-| `w4a16_kpack_gemm` | 1452-2900 us | 1455-2936 us | 1582-2953 us |
-| `rdna2_w4a16_gemv_m` | 86-148 us | 98-174 us | 98-130 us |
-
-kpack GEMM is ~0 GB/s effective at these M — 15-17x slower than gemv_m.
-~200 W4 layers x ~2.8 ms = ~560 ms/step, matching the observed 3 t/s MTP
-regression exactly. GPTQ+MTP was never affected (Exllama has its own M<=8
-fast path).
-
-**Greediness**: AWQ kpack=0 + MTP = 7/8 identical + 1 benign single-token
-drift ("easy borrowing" -> "borrowing" at char 577 of a 220-tok essay,
-re-converges) vs the kpack=1 baseline — expected kernel-swap numerics, not
-corruption. Primes remain byte-exact.
-
-**Parked fix (next session, ~1 line + tests)**: in
-`_op_dispatch_kpack` (rdna2_triton_w4a16.py:54), route `1 < M <= 4` to
-`rdna2_w4a16_gemv_m` when kpack is on (needs the N-packed weight view or a
-kpack-aware gemv_m variant — decide after checking how the kpack repack
-step stores weights; possibly just unpack on the fly or keep both
-layouts). Until then: **AWQ+MTP users must set VLLM_RDNA2_W4_KPACK=0**
-(costs ~10% at M=1 decode vs kpack: 32.0 vs 34.7 t/s short-ctx MTP=0
-equivalent).
-
-**Also found this round**:
-- AWQ bundle MTP=0: 30.1 t/s @3.5k / 26.6 @13.4k (vs GPTQ 34.7/34.1).
-  Remaining gap = AWQ's unquantized fp16 GDN+MTP weights (the checkpoint's
-  ignore list; ~12 ms/step) — NOT kernel-side.
-- AWQ 41k-ctx runs die: chunked-prefill 7760-token chunk takes >3 min
-  (eager GDN prefill on fp16 projections + FULL_DECODE_ONLY = no piecewise
-  graphs for prefill), exceeding the 300 s engine dequeue timeout. GPTQ
-  quantized GDN so its prefill is ~4x smaller. Workarounds: raise
-  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS, use FULL_AND_PIECEWISE for AWQ, or
-  cap ctx. Proper fix = quantized-GDN AWQ checkpoint (out of scope,
-  checkpoints frozen).
+**Remaining AWQ items (parked)**:
+1. MTP + prefix-cache anomaly: TTFT under MTP implies full re-prefill
+   every request (724 s @41k, 33 s @3.7k) — decode-rate numbers above
+   understate real interactive latency until fixed.
+2. AWQ 41k prefill is ~12 min (survives now, still slow): fp16 GDN
+   prefill on the checkpoint's unquantized projections. GPTQ unaffected.
+3. AWQ nospec gap vs GPTQ (30.1 vs 34.7 @3.5k) = the fp16 GDN/MTP
+   weights (checkpoint ignore list) — structural.
 
 ## Item 5 (DONE 2026-08-22): recipe REPLICATED on GPTQ — MTP shipping
 
