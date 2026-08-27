@@ -42,6 +42,27 @@ numeric drift from layout/kernel changes, primes byte-exact everywhere).
    Qwen3_5MoeMTP drafter's expert param mapping doesn't match the
    GPTQ/MoeWNA16 method's expected names. MTP arms dropped (parked bug).
 
+## MTP addendum (2026-08-23) — MoE+MTP fixed and benchmarked
+
+The MoE+MTP weight-load bug is FIXED (unquantized-MTP detection from
+checkpoint metadata + MoeWNA16 dynamic handling). MTP now runs on both
+quants (see commits; primes byte-exact, gates 7/8 + benign drift):
+
+| Config | c=1 TPOT | c=1 t/s | c=8 | c=32 | c=64 | acceptance |
+|---|---:|---:|---:|---:|---:|---:|
+| GPTQ MTP0 | 22.5 | 44.6 | 159.8 | 299.0 | 396.4 | — |
+| GPTQ MTP2 | 19.6 | 51.5 | 35.6* | 167.9 | 318.6 | 1.10 |
+| AWQ MTP2 | 15.7 | **64.2** | 0.2* | 209.7 | 375.5 | 1.15 |
+
+*c=8 rows anomalous this round (one bad 60 s window each); the c≥8
+MTP-loses pattern is consistent at c=32/64 regardless.
+
+**Verdict**: MTP acceptance is only ~1.1 on this model family (BF16
+drafter diverges from the quantized target — MoE routing is especially
+sensitive), so MTP is a **single-stream tool here**: AWQ+MTP2 = 64.2 t/s
+best-in-round (+27%), but throughput serving stays on MTP=0 (AWQ: 491
+@c64). Production script: serve_q36_35b.sh (AWQ default, MTP env knob).
+
 ## Notes
 
 - guidellm synthetic data needs `--tokenizer kind=huggingface_auto,model=...`
