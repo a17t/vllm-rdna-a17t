@@ -60,8 +60,6 @@ exec /mnt/Dev/vllm-rdna2/venv/bin/vllm serve "${MODEL}" \
     --enable-prefix-caching \
     ${SPEC_ARG} \
     --compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-    --language-model-only \
-    --skip-mm-profiling \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
