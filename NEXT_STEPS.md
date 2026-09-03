@@ -1,4 +1,51 @@
-# NEXT STEPS — parked work items (updated 2026-08-22)
+# NEXT STEPS — parked work items (updated 2026-08-23)
+
+## Item 7 (DIAGNOSED 2026-08-23): MTP breaks prefix caching on hybrid models
+
+Symptom: with MTP=2, every request re-prefills from scratch — TTFT for a
+~14.4k-token prompt is 145-160 s on the repeat request; without MTP the
+identical request hits cache at 6-13 s. /metrics:
+`prefix_cache_hits_total` = 0 under MTP vs 31,040 without (same prompt,
+same server config otherwise).
+
+**Instrumented evidence chain** (27B GPTQ, TP2, cards 0,1, int8 KV,
+mamba cache mode 'align'; debug via temporary DBG-PFX logging, since
+removed):
+
+| Signal | MTP=0 | MTP=2 |
+|---|---|---|
+| attention block size | 1552 | 1568 (draft layer shifts page math) |
+| store: full-attn group | 20/20 blocks inserted | 20/20 inserted |
+| store: mamba groups | sparse by design (1 in 4-5 non-null) | same sparse pattern |
+| pool entries after req1 | 23 (attn + mamba partials) | **20 (attn only)** |
+| free() removes hashes | no | no |
+| req2 lookup | hit=31040, per_group=[20,20,20,20] | hit=0, per_group=[0,0,0,0] |
+
+**Mechanism**: under eagle-family spec decode the coordinator is built
+with `use_eagle=True` / `num_prefill_lookahead>0`
+(kv_cache_coordinator.py:84,96,114-133); the mamba groups' hash
+insertion goes through `reachable_block_mask(use_eagle=...)`
+(single_type_kv_cache_manager.py:455-463) and NO mamba entry ever lands
+in `cached_block_hash_to_block` (pool holds exactly the full-attention
+entries). The hybrid chained lookup
+(single_type_kv_cache_manager.py:746-753: `get_cached_block(hash,
+group_ids)` then `break` on first miss) then fails at the first hash and
+zeroes EVERY group's hit — full-attention blocks sitting in the pool are
+unreachable. Without MTP the same sparse-mamba storage yields a working
+20-block chain, so the eagle-aware eligibility/alignment logic (not the
+storage pattern) is what diverges.
+
+**Why it matters**: TTFT under MTP at long context = full re-prefill
+every request (147-724 s @37-41k on the 27B stacks). Decode throughput
+is unaffected.
+
+**Fix scope: NOT small** (parked). Suspects to start from:
+`reachable_block_mask` eagle branch masking mamba hash inserts;
+`drop_eagle_block` in find_longest_cache_hit (manager:~782-786);
+alignment semantics (`_cache_hit_alignment_tokens`,
+`hash_block_size` 1552-vs-1568 shift under draft layers). Repro:
+identical prompt twice with VLLM_DBG_PFX-style logging re-added, or
+simply compare /metrics prefix_cache_hits under MTP 0 vs 2.
 
 ## Item 6 (FIXED 2026-08-22): AWQ+MTP root cause = kpack GEMM at M>1 — LANDED
 
