@@ -35,7 +35,15 @@ export FD_CHUNK=512
 export FD_TILE=32
 export FD_WARPS=8
 export FD_MAXQ=4
-export AR_RDNA2="${AR_RDNA2:-0}"     # allreduce plugin validated separately
+# AR_RDNA2 push-based allreduce: VALIDATED 2026-09-03 and REJECTED on this
+# stack — correct (8/8 greedy identical, 11-min soak clean) but SLOWER:
+# 21.4-21.9 vs 24.9-25.0 t/s single-stream decode (-12%), neutral at c=8
+# (33.2 vs 33.4). The recipe's +1.9% did not reproduce here (their stack:
+# torch 2.11, plain MTP-less serving; ours: MTP k=2 multiplies the
+# per-call dispatch overhead). To re-test: needs ROCM_HOME=/opt/rocm AND
+# a /opt/rocm/bin/hipcc symlink to /usr/bin/hipcc for the extension to
+# build (Gentoo layout — see NEXT_STEPS Item 8).
+export AR_RDNA2="${AR_RDNA2:-0}"
 export GPU_MAX_HW_QUEUES=4
 export HIP_FORCE_DEV_KERNARG=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True

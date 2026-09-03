@@ -1,4 +1,47 @@
-# NEXT STEPS — parked work items (updated 2026-08-23)
+# NEXT STEPS — parked work items (updated 2026-09-03)
+
+## Item 8 (CLOSED 2026-09-03): AR_RDNA2 allreduce — validated, REJECTED (slower)
+
+Full validation done on the 27B GPTQ production config (cards 0,1, idle
+host, MTP k=2):
+
+| Metric | AR off | AR on | verdict |
+|---|---:|---:|---|
+| greedy validate | — | **8/8 identical** + PASS | correct |
+| 11-min soak (conc 3) | — | err=0, thermals sane | stable |
+| decode @3.4k | 24.9-25.0 | 21.4-21.9 | **-12%** |
+| decode @11.2k | 24.2 | 21.9 | -9% |
+| guidellm c=8 out t/s | 33.4 | 33.2 | neutral |
+
+The recipe's +1.9% did NOT reproduce on our stack. Hypothesis: with MTP
+k=2 the step issues ~2x the allreduces (verify + drafter forwards); the
+plugin's per-call Python patch + can()/all_reduce() dispatch overhead
+(~30 us x ~128 ops ~ 3.8 ms/token) exceeds the kernel's win at
+single-stream. At c=8 the difference vanishes (compute-bound). Defaults
+stay AR_RDNA2=0 everywhere; do not re-test without changing the per-call
+overhead question first (e.g. batching the patch out of the hot loop).
+
+**Build gotchas for anyone re-enabling** (both fixed on this host):
+1. `ROCM_HOME=/opt/rocm` must be exported — torch's default resolution
+   lands on /usr (via /usr/bin/hipcc), adding `-isystem /usr/include`
+   which breaks clang's include_next -> 'math.h' not found.
+2. `/opt/rocm/bin/hipcc` must exist (symlinked to /usr/bin/hipcc here) —
+   Gentoo's ROCm layout doesn't provide it; without it the extension
+   build fails and the plugin SILENTLY falls back to stock (by design).
+   The plugin's extension builds into TORCH_EXTENSIONS_DIR/rankN.
+
+## Item 8b (NEW, OPEN): absolute decode regression post-2026-08-27 reboot?
+
+Same 27B GPTQ config that measured 41.3 t/s @3.5k on 2026-08-22 now
+measures 24.9 (AR off, today). Acceptance healthy (2.05 vs 2.35 then —
+explains ~12% only). Host diagnostics inconclusive: rocm-smi telemetry
+reads 0%/8W DURING active decode (stale/broken post-reboot), but kpack
+GEMV microbench hits 478 GB/s (82% of best-ever — healthy). Candidates:
+(a) machine-level clock/power state stuck since reboot, (b) a tree
+change since d8665a7ec1 (kpack fixes? MTP-unquantized detection?
+fp16-dot?) interacting with this stack. Next session: bisect by git
+stash-ing commits on the serve config, or reboot and re-measure the
+replication-round exact config first.
 
 ## Item 7 (DIAGNOSED 2026-08-23): MTP breaks prefix caching on hybrid models
 

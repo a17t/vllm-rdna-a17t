@@ -264,3 +264,4 @@ traces/
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+runlogs/
