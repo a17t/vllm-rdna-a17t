@@ -1,5 +1,38 @@
 # NEXT STEPS — parked work items (updated 2026-09-03)
 
+## Item 8b (CLOSED 2026-09-03): absolute decode regression — POWER LIMITS
+
+**Root cause: per-card power limits had been lowered** sometime after
+08-22; restoring them (user, exact W value not recorded) recovered
+performance. Confirms the recipe's warning that power silently caps
+everything — and explains why short-burst microbenches stayed near
+healthy (478 GB/s) while sustained decode throttled ~40%.
+
+| Measurement | degraded (09-03 AM) | recovered (09-03 PM) | good ref (08-22) |
+|---|---:|---:|---:|
+| decode @~3.2-3.4k | 24.9 | **34.4** | 41.3* |
+| decode @~11-13k | 24.2 | **36.1** | 36.6 |
+| decode @~37k | — | **29.5** | 28.5 |
+| guidellm c=8 out t/s | 33.4 | **59.6** | — |
+| ms/step (per-step basis) | — | **59.4** | 56.9 |
+
+\*The residual gap to 41.3 is acceptance variance (2.04 today vs 2.35 on
+08-22 — content-dependent, decode-rate.py regenerates a fresh uuid filler
+per run): on the per-step basis we are within 4.4% of the good day.
+Verification habit for the future: compare ms/step
+(= ms/token x acceptance), not t/s, when acceptance shifts.
+
+**Standing implication**: treat any unexplained multi-10% regression as
+suspect-power-first (check `amd-smi metric --showpower` under load;
+rocm-smi telemetry was stale/broken post-reboot and read 0%/8W during
+active decode — use amd-smi).
+
+**Fallout (relative A/Bs unaffected — both arms equally throttled)**:
+AR rejection (-12%), 35B MTP round, prefix-cache diagnosis stand. Their
+absolute numbers were taken degraded: today's AR table, the 35B MTP
+addendum (BM35-RESULTS), Item-7 TTFTs. Refresh any of them if they feed
+decisions.
+
 ## Item 8 (CLOSED 2026-09-03): AR_RDNA2 allreduce — validated, REJECTED (slower)
 
 Full validation done on the 27B GPTQ production config (cards 0,1, idle

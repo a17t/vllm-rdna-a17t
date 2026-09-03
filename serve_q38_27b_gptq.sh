@@ -5,6 +5,11 @@
 # Measured (idle host, verify/decode-rate.py, greedy):
 #   MTP=0: 34.7 t/s @3.5k / 34.1 @13k / 29.9 @39k ctx
 #   MTP=2: 41.3 t/s @3.5k / 36.6 @11k / 28.5 @37k ctx (8/8 greedy-identical)
+#   MTP=2 refresh 09-03: 34.4 @3.2k / 36.1 @13.4k / 29.5 @37k (acceptance
+#   2.04 vs 2.35 — per-step basis within 4% of the 08-22 numbers); c=8
+#   guidellm 59.6 out t/s. If numbers sag: CHECK CARD POWER LIMITS FIRST
+#   (Item 8b — a lowered cap cost ~40% and rocm-smi lied about it; use
+#   amd-smi metric --showpower under load).
 # vs the fp16-KV AWQ stack's 25.7 / 14.2 / 6.3.
 #
 # Key ingredients (each individually reversible):
