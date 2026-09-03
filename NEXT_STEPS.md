@@ -1,5 +1,30 @@
 # NEXT STEPS — parked work items (updated 2026-09-03)
 
+## Item 10 (DONE 2026-09-03): merged to v0.28-dev baseline — +19% free
+
+Merged e25c586b9 (the vllm-rdna fork's branch point, 218 upstream
+commits past our v0.27.1 base) — **zero conflicts**, all 98 RDNA2 kernel
+tests pass, C++ rebuilt (0.27.2.dev940+g32c1dced4). Validation on the
+27B GPTQ production config (cards 0,1, idle host):
+
+| Metric | 0.27.1 (yesterday) | **0.28-dev (today)** |
+|---|---:|---:|
+| decode @3.6k | 34.4 | **40.8 (+19%)** |
+| decode @13.4k | 36.1 | **39.0 (+8%)** |
+| acceptance | 2.04 | **2.28-2.62** (healthy again) |
+| TTFT @3.6k | 10.9 s | 4.9 s |
+| greedy gate | — | **8/8 identical** vs pre-merge baseline |
+
+Same per-card power limits both days. The gain is upstream's (mamba
+align fixes, attention, etc.). serve_q38_27b_gptq.sh unchanged and now
+faster. This also aligns our tree with the vllm-rdna fork's baseline —
+their kernel ports (FORK-COMPARISON Item 9) can now be cherry-picked
+with minimal API adaptation.
+
+Note: the fresh 0.28-dev compile needs ~1.4 GB disk per config hash and
+briefly filled /root during bring-up alongside a 20 GB model download —
+watch disk when cold-compiling new configs.
+
 ## Item 9 (NEW, REFERENCE): vllm-rdna fork comparison — adoption candidates catalogued
 
 A second RDNA2 fork (`/mnt/Dev/vllm-rdna2/vllm-rdna`, branch rdna_extras,
