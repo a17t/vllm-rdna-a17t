@@ -1,5 +1,25 @@
 # NEXT STEPS — parked work items (updated 2026-09-03)
 
+## Item 9 (NEW, REFERENCE): vllm-rdna fork comparison — adoption candidates catalogued
+
+A second RDNA2 fork (`/mnt/Dev/vllm-rdna2/vllm-rdna`, branch rdna_extras,
+v0.28.0-dev base) was surveyed. Full comparison in
+`FORK-COMPARISON-vllm-rdna.md`. Ranked adoption candidates (no code
+adopted yet):
+
+1. GDN prefill HIP kernels (5 files) — fixes the Triton GDN JIT-hang class
+   and attacks our AWQ 41k prefill pain. Best first port.
+2. GPTQ W4A16 MoE + multi-config prefill — closes the 35B GPTQ −16–21% gap.
+3. Compile-collectives fix (`use_custom_op_collectives=True` recipe) +
+   one TP2 re-test of their stock-kernel `VLLM_FORCE_CUSTOM_ALL_REDUCE`
+   (+30–34% claimed at TP4; our plugin-based AR was rejected at −12% —
+   different code, untested route).
+4. DSV4 family (MXFP4 W4A4 / W8A8-FP8 / sparse MLA / Lightning Indexer).
+5. EXL3 — blocked on their open mul1-inf bug.
+
+Caveat: their ports are v0.28-API-shaped; kernels are portable, Python
+dispatch needs adaptation to our v0.27.1 tree.
+
 ## Item 8b (CLOSED 2026-09-03): absolute decode regression — POWER LIMITS
 
 **Root cause: per-card power limits had been lowered** sometime after
