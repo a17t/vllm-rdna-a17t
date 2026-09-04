@@ -3,7 +3,9 @@
      A17T RDNA2 fork README prefix
 ---------------------------------------------------------------------------- -->
 
-# A17T vLLM RDNA2 fork (`main+rdna2`)
+# A17T vLLM RDNA2 fork (`main+rdna2`) 
+
+This readme is not up to date. 
 
 vLLM ported and tuned for **AMD RDNA2 (gfx1030, Radeon PRO V620)**, maintained
 by A17T. This branch is based on upstream `main` (post-v0.26.1rc0) and carries
